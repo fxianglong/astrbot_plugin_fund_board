@@ -23,8 +23,10 @@ from .importer import (
 from .importer import _to_money as to_money
 from . import alerts
 from .portfolio import CN_TZ, build_summary, drawdown_from_trend, has_trading_today, nav_readiness
-from .render import DISCLAIMER, HELP, render_board, render_list, render_trades
+from .analysis import analyze
+from .render import DISCLAIMER, HELP, render_board, render_check, render_list, render_overlap, render_trades
 from .storage import Settings, Storage
+from .templates import BOARD_TMPL, CHECK_TMPL, board_data, check_data
 
 PLUGIN_NAME = "astrbot_plugin_fund_board"
 CONFIRM_WORDS = {"确认", "确认合并", "确认覆盖"}
@@ -36,7 +38,7 @@ PRIVACY_NOTE = "提示：截图会发送给当前配置的大模型服务商识�
 REPORT_TITLES = {"close": "🔔 收盘估值", "nav": "🌙 净值日报", "manual": "📊 持仓日报"}
 
 
-@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送与回撤提醒", "0.2.0")
+@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒与组合体检", "0.3.0")
 class FundBoard(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -104,9 +106,10 @@ class FundBoard(Star):
         yield event.plain_result(HELP)
 
     @fund.command("board", alias={"看板"})
-    async def board(self, event: AstrMessageEvent):
-        """持仓看板"""
-        holdings = self.storage.list(self._uid(event))
+    async def board(self, event: AstrMessageEvent, mode: str = ""):
+        """持仓看板：/fund board [img|text]"""
+        uid = self._uid(event)
+        holdings = self.storage.list(uid)
         if not holdings:
             yield event.plain_result(render_list([]))
             return
@@ -117,11 +120,110 @@ class FundBoard(Star):
             yield event.plain_result("获取行情失败，请稍后再试。")
             return
         summary = build_summary(holdings, quotes)
-        text = render_board(summary, self._show_amount(event))
-        realized = self.storage.realized_total(self._uid(event))
-        if realized and self._show_amount(event):
+        show = self._show_amount(event)
+        realized = self.storage.realized_total(uid)
+        if self._want_image(mode):
+            path = await self._render_img(
+                BOARD_TMPL, board_data(summary, show, "📊 持仓看板", realized=realized), event.unified_msg_origin
+            )
+            if path:
+                yield event.image_result(path)
+                return
+        text = render_board(summary, show)
+        if realized and show:
             text += f"\n已实现盈亏（卖出记录合计）：{realized:+,.2f}"
         yield event.plain_result(text)
+
+    # ------------------------------------------------------------ 分析
+    def _want_image(self, mode: str) -> bool:
+        m = (mode or "").strip().lower()
+        if m in ("img", "image", "图", "图片"):
+            return True
+        if m in ("text", "txt", "文字"):
+            return False
+        return bool(self.config.get("image_mode", False))
+
+    async def _render_img(self, tmpl: str, data: dict, umo: str | None = None) -> str | None:
+        """渲染图片，返回本地路径；失败返回 None，由调用方退回文字。"""
+        try:
+            return await self.html_render(tmpl, data, return_url=False, umo=umo)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[fund_board] 图片渲染失败，改发文字: {e}")
+            return None
+
+    async def _analyze(self, uid: str):
+        """取重仓股、经理、走势等数据并做穿透分析。返回 (summary, analysis)，没有持仓时返回 None。"""
+        holdings = self.storage.list(uid)
+        if not holdings:
+            return None
+        codes = [h.code for h in holdings]
+        quotes = await self.ds.get_quotes(codes)
+        summary = build_summary(holdings, quotes)
+        sem = asyncio.Semaphore(4)
+
+        async def one(code: str):
+            async with sem:
+                h = p = dd = None
+                try:
+                    h = await self.ds.get_holdings(code)
+                except DataSourceError as e:
+                    logger.warning(f"[fund_board] {code} 重仓股获取失败: {e}")
+                try:
+                    p = await self.ds.get_profile(code)
+                    r = drawdown_from_trend(await self.ds.get_ac_trend(code))
+                    dd = r[0] if r else None
+                except DataSourceError as e:
+                    logger.warning(f"[fund_board] {code} 详情获取失败: {e}")
+                meta = None
+                try:
+                    meta = await self.ds.get_meta(code)
+                except DataSourceError:
+                    pass
+                return code, h, p, dd, (meta.ftype if meta else "")
+
+        results = await asyncio.gather(*(one(c) for c in codes))
+        hs = {c: h for c, h, _, _, _ in results if h}
+        ps = {c: p for c, _, p, _, _ in results if p}
+        dds = {c: dd for c, _, _, dd, _ in results if dd is not None}
+        types = {c: t for c, _, _, _, t in results}
+        return summary, await asyncio.to_thread(analyze, summary, hs, ps, dds, types)
+
+    @fund.command("overlap", alias={"重叠", "穿透"})
+    async def overlap(self, event: AstrMessageEvent):
+        """重仓股穿透与基金重叠分析"""
+        yield event.plain_result("正在获取各基金重仓股，请稍候…")
+        try:
+            res = await self._analyze(self._uid(event))
+        except DataSourceError as e:
+            logger.error(f"[fund_board] 分析失败: {e}")
+            yield event.plain_result("获取数据失败，请稍后再试。")
+            return
+        if not res:
+            yield event.plain_result(render_list([]))
+            return
+        yield event.plain_result(render_overlap(res[1], self._show_amount(event)))
+
+    @fund.command("check", alias={"体检"})
+    async def check(self, event: AstrMessageEvent, mode: str = ""):
+        """组合体检：/fund check [img|text]"""
+        yield event.plain_result("正在体检，需要获取每只基金的重仓股和历史走势，请稍候…")
+        try:
+            res = await self._analyze(self._uid(event))
+        except DataSourceError as e:
+            logger.error(f"[fund_board] 体检失败: {e}")
+            yield event.plain_result("获取数据失败，请稍后再试。")
+            return
+        if not res:
+            yield event.plain_result(render_list([]))
+            return
+        summary, a = res
+        show = self._show_amount(event)
+        if self._want_image(mode):
+            path = await self._render_img(CHECK_TMPL, check_data(a, summary, show), event.unified_msg_origin)
+            if path:
+                yield event.image_result(path)
+                return
+        yield event.plain_result(render_check(a, summary, show))
 
     @fund.command("list", alias={"持仓"})
     async def list_(self, event: AstrMessageEvent):
@@ -295,8 +397,15 @@ class FundBoard(Star):
             yield event.plain_result("已关闭每日推送。")
         elif a in ("now", "test", "测试"):
             st_tmp = Settings(uid, event.unified_msg_origin, event.is_private_chat(), True, st.day_alert, st.dd_alert)
-            status, text = await self._build_report(uid, st_tmp, "manual", datetime.now(CN_TZ))
-            yield event.plain_result(text if status == "ok" else "还没有持仓，或暂时取不到行情。")
+            status, text, img, extra = await self._build_report(uid, st_tmp, "manual", datetime.now(CN_TZ))
+            if status != "ok":
+                yield event.plain_result("还没有持仓，或暂时取不到行情。")
+            elif img:
+                yield event.image_result(img)
+                if extra:
+                    yield event.plain_result(extra)
+            else:
+                yield event.plain_result(text)
         else:
             state = "已开启" if st.push_on else "未开启"
             yield event.plain_result(
@@ -349,37 +458,44 @@ class FundBoard(Star):
                 out[c] = r
         return out
 
-    async def _build_report(self, uid: str, st: Settings, mode: str, now: datetime) -> tuple[str, str]:
-        """生成推送内容。返回 (状态, 文本)，状态：ok / wait（净值未出齐，稍后再试）/ skip（非交易日或无持仓）。"""
+    async def _build_report(
+        self, uid: str, st: Settings, mode: str, now: datetime
+    ) -> tuple[str, str, str | None, str]:
+        """生成推送内容。
+
+        返回 (状态, 完整文字, 图片路径或 None, 提醒文字)。
+        状态：ok / wait（净值未出齐，稍后再试）/ skip（非交易日或无持仓）。
+        开启图片模式时，看板渲染成图片，提醒仍以文字附在后面。
+        """
         holdings = self.storage.list(uid)
         if not holdings:
-            return "skip", ""
+            return "skip", "", None, ""
         codes = [h.code for h in holdings]
         try:
             quotes = await self.ds.get_quotes(codes)
         except DataSourceError as e:
             logger.error(f"[fund_board] 推送取行情失败: {e}")
-            return "wait", ""
+            return "wait", "", None, ""
         today = now.strftime("%Y-%m-%d")
         if mode in ("close", "nav") and not has_trading_today(quotes, today):
-            return "skip", ""
+            return "skip", "", None, ""
         retry_until = self._cfg_time("nav_retry_until", "23:30")
         if mode == "nav":
             ready, pending = nav_readiness(quotes, codes, today)
             late = now.strftime("%H:%M") >= retry_until
             if (pending or not ready) and not late:
-                return "wait", ""
+                return "wait", "", None, ""
             if not ready:
-                return "skip", ""
+                return "skip", "", None, ""
 
         summary = build_summary(holdings, quotes, now)
         show = st.private or bool(self.config.get("group_show_amount", False))
-        lines = [render_board(summary, show, now, REPORT_TITLES[mode])]
+        extra: list[str] = []
         day_th, dd_th = self._thresholds(st)
 
         if mode == "close":
             if day_th > 0 and summary.day_pct is not None and summary.day_pct <= -day_th:
-                lines.append(f"⚠️ 按盘中估值，组合今日约下跌 {abs(summary.day_pct):.2f}%，超过 {day_th:g}% 提醒线。")
+                extra.append(f"⚠️ 按盘中估值，组合今日约下跌 {abs(summary.day_pct):.2f}%，超过 {day_th:g}% 提醒线。")
         else:
             portfolio = None
             if mode == "nav" and summary.day_pct is not None:
@@ -390,14 +506,26 @@ class FundBoard(Star):
             alert_lines = alerts.evaluate(
                 self.storage, uid, summary, day_th, dd_th, portfolio, fund_dds, dry=(mode == "manual")
             )
-            if alert_lines:
-                lines.append("")
-                lines.extend(alert_lines)
-        return "ok", "\n".join(lines)
+            extra.extend(alert_lines)
+        extra_text = "\n".join(extra)
+        text = render_board(summary, show, now, REPORT_TITLES[mode]) + (f"\n\n{extra_text}" if extra else "")
+        img = None
+        if self._want_image(""):
+            realized = self.storage.realized_total(uid)
+            data = board_data(summary, show, REPORT_TITLES[mode], now, realized if show else 0.0)
+            img = await self._render_img(BOARD_TMPL, data, st.umo)
+        return "ok", text, img, extra_text
 
-    async def _send(self, st: Settings, text: str) -> None:
+    async def _send(self, st: Settings, text: str, img: str | None = None, extra: str = "") -> None:
+        chain = MessageChain()
+        if img:
+            chain.file_image(img)
+            if extra:
+                chain.message(extra)
+        else:
+            chain.message(text)
         try:
-            ok = await self.context.send_message(st.umo, MessageChain().message(text))
+            ok = await self.context.send_message(st.umo, chain)
             if not ok:
                 logger.warning(f"[fund_board] 推送失败，找不到会话 {st.umo}")
         except Exception as e:  # noqa: BLE001
@@ -414,11 +542,11 @@ class FundBoard(Star):
             for st in subs:
                 if st.last_close == today:
                     continue
-                status, text = await self._build_report(st.user_id, st, "close", now)
+                status, text, img, extra = await self._build_report(st.user_id, st, "close", now)
                 if status == "wait":
                     continue
                 if status == "ok":
-                    await self._send(st, text)
+                    await self._send(st, text, img, extra)
                 st.last_close = today
                 self.storage.save_settings(st)
 
@@ -429,12 +557,12 @@ class FundBoard(Star):
             for st in subs:
                 if st.last_nav == today:
                     continue
-                status, text = await self._build_report(st.user_id, st, "nav", now)
+                status, text, img, extra = await self._build_report(st.user_id, st, "nav", now)
                 if status == "wait":
                     waiting = True
                     continue
                 if status == "ok":
-                    await self._send(st, text)
+                    await self._send(st, text, img, extra)
                 st.last_nav = today
                 self.storage.save_settings(st)
             self._nav_next_try = now + timedelta(minutes=30) if waiting else None

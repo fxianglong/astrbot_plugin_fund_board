@@ -25,8 +25,10 @@ VALUATION_URL = "https://fundcomapi.tiantianfunds.com/mm/newCore/FundValuationLa
 VALUATION_FIELDS = "FCODE,SHORTNAME,GSZZL,GZTIME,GSZ,NAV,PDATE,NAVCHGRT"
 # 全量基金代码表：[[代码, 拼音缩写, 名称, 类型, 拼音全称], ...]
 FUND_LIST_URL = "https://fund.eastmoney.com/js/fundcode_search.js"
-# 单只基金的详情脚本（阶段收益、净值走势等）
+# 单只基金的详情脚本（阶段收益、净值走势、现任经理、资产配置等）
 PINGZHONG_URL = "https://fund.eastmoney.com/pingzhongdata/{code}.js"
+# 天天基金移动端：最新一期季报前十大重仓股（含所属行业）
+HOLDINGS_URL = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNInverstPosition"
 
 
 def _num(v) -> float | None:
@@ -53,6 +55,48 @@ class Quote:
 
 
 @dataclass
+class StockPos:
+    code: str
+    name: str
+    weight: float  # 占基金净值比例 %
+    industry: str
+
+
+@dataclass
+class FundHoldings:
+    report_date: str | None  # 季报截止日
+    stocks: list[StockPos]
+
+
+@dataclass
+class FundProfile:
+    """pingzhongdata 里体检用到的信息。"""
+
+    stock_ratio: float | None  # 最新一期股票占净比 %
+    managers: list[tuple[str, int]]  # [(姓名, 任职天数)]
+    return_1y: float | None  # 近一年收益 %
+
+
+def extract_js_var(text: str, name: str):
+    """从 `var name = <JSON>;` 中取出 JSON 值，取不到返回 None。"""
+    m = re.search(rf"var\s+{re.escape(name)}\s*=\s*", text)
+    if not m:
+        return None
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text, m.end())
+    except json.JSONDecodeError:
+        return None
+    return value
+
+
+def parse_work_days(s: str) -> int:
+    """'9年又50天' / '1年' / '200天' -> 天数。"""
+    years = re.search(r"(\d+)\s*年", s or "")
+    days = re.search(r"(\d+)\s*天", s or "")
+    return (int(years.group(1)) * 365 if years else 0) + (int(days.group(1)) if days else 0)
+
+
+@dataclass
 class FundMeta:
     code: str
     name: str
@@ -75,6 +119,8 @@ class FundDataSource:
         self._fund_map: dict[str, FundMeta] = {}
         self._list_lock = asyncio.Lock()
         self._pz_cache: dict[str, tuple[str, str]] = {}  # code -> (日期, 脚本内容)
+        self._holdings_cache: dict[str, tuple[str, "FundHoldings"]] = {}
+        self._pz_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ HTTP
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -205,12 +251,14 @@ class FundDataSource:
     async def _get_pingzhong(self, code: str) -> str:
         """单只基金详情脚本，按天缓存（阶段收益和走势一天内不会变）。"""
         day = time.strftime("%Y%m%d")
-        hit = self._pz_cache.get(code)
-        if hit and hit[0] == day:
-            return hit[1]
-        text = await self._fetch_text(PINGZHONG_URL.format(code=code), params={"v": int(time.time())})
-        self._pz_cache[code] = (day, text)
-        return text
+        lock = self._pz_locks.setdefault(code, asyncio.Lock())
+        async with lock:  # 同一基金并发请求时只下载一次
+            hit = self._pz_cache.get(code)
+            if hit and hit[0] == day:
+                return hit[1]
+            text = await self._fetch_text(PINGZHONG_URL.format(code=code), params={"v": int(time.time())})
+            self._pz_cache[code] = (day, text)
+            return text
 
     async def get_period_returns(self, code: str) -> dict[str, float | None]:
         return self.parse_period_returns(await self._get_pingzhong(code))
@@ -236,3 +284,61 @@ class FundDataSource:
 
     async def get_ac_trend(self, code: str) -> list[tuple[int, float]]:
         return self.parse_ac_trend(await self._get_pingzhong(code))
+
+    # ------------------------------------------------------------ 体检资料
+    @staticmethod
+    def parse_profile(text: str) -> FundProfile:
+        stock_ratio = None
+        alloc = extract_js_var(text, "Data_assetAllocation")
+        if isinstance(alloc, dict):
+            for s in alloc.get("series") or []:
+                if "股票" in str(s.get("name", "")) and s.get("data"):
+                    stock_ratio = _num(s["data"][-1])
+        managers = []
+        for m in extract_js_var(text, "Data_currentFundManager") or []:
+            if isinstance(m, dict) and m.get("name"):
+                managers.append((str(m["name"]), parse_work_days(str(m.get("workTime", "")))))
+        m1y = re.search(r'var\s+syl_1n\s*=\s*"([^"]*)"', text)
+        return FundProfile(stock_ratio, managers, _num(m1y.group(1)) if m1y else None)
+
+    async def get_profile(self, code: str) -> FundProfile:
+        return self.parse_profile(await self._get_pingzhong(code))
+
+    @staticmethod
+    def parse_holdings(payload: dict) -> FundHoldings:
+        if not payload or not payload.get("Success"):
+            raise DataSourceError(f"重仓股接口返回失败: {payload.get('ErrMsg') if payload else ''}")
+        stocks = []
+        for s in (payload.get("Datas") or {}).get("fundStocks") or []:
+            w = _num(s.get("JZBL"))
+            name = str(s.get("GPJC") or "").strip()
+            if w is None or not name:
+                continue
+            stocks.append(
+                StockPos(
+                    code=str(s.get("GPDM") or "").strip(),
+                    name=name,
+                    weight=w,
+                    industry=str(s.get("INDEXNAME") or "").strip() or "其他",
+                )
+            )
+        rd = payload.get("Expansion")
+        return FundHoldings(str(rd)[:10] if rd else None, stocks[:10])
+
+    async def get_holdings(self, code: str) -> FundHoldings:
+        """最新一期季报前十大重仓股，按天缓存。"""
+        day = time.strftime("%Y%m%d")
+        hit = self._holdings_cache.get(code)
+        if hit and hit[0] == day:
+            return hit[1]
+        text = await self._fetch_text(
+            HOLDINGS_URL,
+            params={"FCODE": code, "deviceid": "Wap", "plat": "WAP", "product": "EFund", "version": "2.0.0"},
+        )
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise DataSourceError("重仓股接口返回的不是 JSON") from e
+        h = self.parse_holdings(payload)
+        self._holdings_cache[code] = (day, h)
+        return h
