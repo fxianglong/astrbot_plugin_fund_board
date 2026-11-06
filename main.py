@@ -18,7 +18,9 @@ from .importer import (
     finalize,
     parse_llm_json,
     render_draft,
+    render_changes,
     resolved_codes,
+    diff_holdings,
 )
 from .importer import _to_money as to_money
 from . import alerts
@@ -32,7 +34,7 @@ from .weekly import SYSTEM_PROMPT, build_week, llm_prompt, render_weekly, saniti
 TOOL_NOTE = "（以上为用户在基金持仓看板插件中记录的数据。回答时只陈述数据，不要给出买入、卖出等操作建议。）"
 
 PLUGIN_NAME = "astrbot_plugin_fund_board"
-CONFIRM_WORDS = {"确认", "确认合并", "确认覆盖"}
+CONFIRM_WORDS = {"确认", "确认合并", "确认覆盖", "确认更新"}
 DONE_WORDS = {"完成", "好了", "好", "ok", "识别", "开始"}
 CANCEL_WORDS = {"取消", "退出", "算了"}
 PRIVACY_NOTE = "提示：截图会发送给当前配置的大模型服务商识别，请确认你接受。识别结果只保存在本机 AstrBot 的数据库里。"
@@ -41,7 +43,7 @@ PRIVACY_NOTE = "提示：截图会发送给当前配置的大模型服务商识�
 REPORT_TITLES = {"close": "🔔 收盘估值", "nav": "🌙 净值日报", "manual": "📊 持仓日报"}
 
 
-@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.4.0")
+@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.4.1")
 class FundBoard(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -56,6 +58,7 @@ class FundBoard(Star):
         self.ds = FundDataSource(data_dir, timeout=int(config.get("request_timeout", 10) or 10))
         self._matcher: FundMatcher | None = None
         self._nav_next_try: datetime | None = None
+        self._qdii_next: datetime | None = None
         self._task = asyncio.create_task(self._scheduler_loop())
 
     # ------------------------------------------------------------ 工具方法
@@ -647,6 +650,8 @@ class FundBoard(Star):
             elif mode == "manual":
                 portfolio = self.storage.latest_index(uid)
             fund_dds = await self._fund_drawdowns(codes) if dd_th > 0 else {}
+            if mode == "nav":  # 记下推送过的净值日期，QDII 补推据此判断有没有新净值
+                self.storage.set_reported(uid, {c: q.nav_date for c, q in quotes.items() if q.nav_date})
             alert_lines = alerts.evaluate(
                 self.storage, uid, summary, day_th, dd_th, portfolio, fund_dds, dry=(mode == "manual")
             )
@@ -695,8 +700,56 @@ class FundBoard(Star):
             st.last_weekly = key
             self.storage.save_settings(st)
 
+    async def _tick_qdii(self, now: datetime) -> None:
+        """没有盘中估值的基金（主要是 QDII）净值往往晚 1～2 天公布，出了新净值就补推一条。"""
+        if not self.config.get("qdii_push", True):
+            return
+        if self._qdii_next and now < self._qdii_next:
+            return
+        interval = int(self.config.get("qdii_check_minutes", 60) or 60)
+        self._qdii_next = now + timedelta(minutes=max(interval, 10))
+        if not ("08:00" <= now.strftime("%H:%M") <= "23:30"):
+            return
+        for st in self.storage.subscribers():
+            holdings = self.storage.list(st.user_id)
+            if not holdings:
+                continue
+            try:
+                quotes = await self.ds.get_quotes([h.code for h in holdings])
+            except DataSourceError as e:
+                logger.warning(f"[fund_board] QDII 补推取行情失败: {e}")
+                return
+            reported = self.storage.get_reported(st.user_id)
+            fresh, init = [], {}
+            for h in holdings:
+                q = quotes.get(h.code)
+                if not q or q.est is not None or not q.nav_date or q.nav is None:
+                    continue
+                last = reported.get(h.code)
+                if last is None:
+                    init[h.code] = q.nav_date  # 第一次见到这只基金，只记录不推送
+                elif q.nav_date > last:
+                    fresh.append((h, q))
+            if init:
+                self.storage.set_reported(st.user_id, init)
+            if not fresh:
+                continue
+            show = st.private or bool(self.config.get("group_show_amount", False))
+            lines = ["🌏 净值更新（QDII 等延迟公布的基金）"]
+            for h, q in fresh:
+                pct = f"{q.nav_pct:+.2f}%" if q.nav_pct is not None else "--"
+                line = f"· {q.name or h.name}：{q.nav_date[5:]} 净值 {q.nav}，当日 {pct}"
+                if show and q.nav_pct is not None and q.nav_pct > -100:
+                    mv = h.shares * q.nav
+                    line += f"，约 {mv - mv / (1 + q.nav_pct / 100):+,.0f} 元"
+                lines.append(line)
+            lines.append(DISCLAIMER)
+            await self._send(st, "\n".join(lines))
+            self.storage.set_reported(st.user_id, {h.code: q.nav_date for h, q in fresh})
+
     async def _tick(self, now: datetime) -> None:
         await self._tick_weekly(now)
+        await self._tick_qdii(now)
         if now.weekday() >= 5:  # 周末不推送日报；节假日由"今天有没有估值/净值"判断
             return
         hm, today = now.strftime("%H:%M"), now.strftime("%Y-%m-%d")
@@ -838,6 +891,14 @@ class FundBoard(Star):
                     return
                 if not rows:
                     await ev.send(ev.plain_result("没有可导入的基金，已结束。"))
+                    controller.stop()
+                    return
+                existing = {h.code: h for h in self.storage.list(uid)}
+                if text == "确认更新" and existing:
+                    navs = {c: q.nav for c, q in quotes.items() if q.nav}
+                    changes, missing = diff_holdings(existing, rows, navs)
+                    self.storage.apply_changes(uid, changes)
+                    await ev.send(ev.plain_result(render_changes(changes, missing, show_amount)))
                     controller.stop()
                     return
                 replace_all = text == "确认覆盖"

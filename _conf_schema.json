@@ -94,5 +94,17 @@
     "type": "bool",
     "default": true,
     "hint": "开启后，和机器人正常聊天时可以直接问「我哪只基金亏得最多」之类的问题（需要模型支持函数调用）。群聊中只提供百分比。"
+  },
+  "qdii_push": {
+    "description": "QDII 净值补推",
+    "type": "bool",
+    "default": true,
+    "hint": "没有盘中估值的基金（主要是 QDII）晚 1～2 天公布净值，公布后单独推送一条。只发给开启了每日推送的用户。"
+  },
+  "qdii_check_minutes": {
+    "description": "QDII 净值检查间隔（分钟）",
+    "type": "int",
+    "default": 60,
+    "hint": "每天 08:00～23:30 按此间隔检查，最小 10 分钟。"
   }
 }
