@@ -80,6 +80,11 @@ class Storage:
                 PRIMARY KEY (user_id, date));
             -- 回撤提醒的已提醒档位，避免每天重复提醒同一档
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            -- v0.6 自定义标签与目标比例
+            CREATE TABLE IF NOT EXISTS tags (
+                user_id TEXT NOT NULL, code TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY (user_id, code));
+            CREATE TABLE IF NOT EXISTS targets (
+                user_id TEXT NOT NULL, tag TEXT NOT NULL, pct REAL NOT NULL, PRIMARY KEY (user_id, tag));
             -- 每日快照：每个交易日记录一次组合市值和成本，用于计算区间收益和 XIRR
             CREATE TABLE IF NOT EXISTS snapshots (
                 user_id TEXT NOT NULL, date TEXT NOT NULL, mv REAL NOT NULL, cost REAL NOT NULL,
@@ -401,6 +406,35 @@ class Storage:
                 "ON CONFLICT(user_id, code) DO UPDATE SET nav_date=excluded.nav_date",
                 [(user_id, c, d) for c, d in items.items()],
             )
+
+    # ------------------------------------------------------------ 标签与目标
+    def set_tag(self, user_id: str, code: str, tag: str | None) -> None:
+        with self.conn:
+            if tag:
+                self.conn.execute(
+                    "INSERT INTO tags (user_id, code, tag) VALUES (?,?,?) "
+                    "ON CONFLICT(user_id, code) DO UPDATE SET tag=excluded.tag",
+                    (user_id, code, tag),
+                )
+            else:
+                self.conn.execute("DELETE FROM tags WHERE user_id=? AND code=?", (user_id, code))
+
+    def tags(self, user_id: str) -> dict[str, str]:
+        return dict(self.conn.execute("SELECT code, tag FROM tags WHERE user_id=?", (user_id,)).fetchall())
+
+    def set_target(self, user_id: str, tag: str, pct: float | None) -> None:
+        with self.conn:
+            if pct is None:
+                self.conn.execute("DELETE FROM targets WHERE user_id=? AND tag=?", (user_id, tag))
+            else:
+                self.conn.execute(
+                    "INSERT INTO targets (user_id, tag, pct) VALUES (?,?,?) "
+                    "ON CONFLICT(user_id, tag) DO UPDATE SET pct=excluded.pct",
+                    (user_id, tag, pct),
+                )
+
+    def targets(self, user_id: str) -> dict[str, float]:
+        return dict(self.conn.execute("SELECT tag, pct FROM targets WHERE user_id=?", (user_id,)).fetchall())
 
     # ------------------------------------------------------------ 提醒档位
     def get_alert_level(self, user_id: str, scope: str) -> int:

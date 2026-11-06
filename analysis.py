@@ -68,6 +68,8 @@ class Analysis:
 
 def short_type(ftype: str) -> str:
     t = ftype or "未知"
+    if "海外" in t:  # 天天基金新分类把部分 QDII 记为「指数型-海外股票」
+        return "QDII"
     for key in ("QDII", "FOF", "货币", "债券", "指数", "股票", "混合"):
         if key in t:
             return {"指数": "指数型", "股票": "股票型", "混合": "混合型", "债券": "债券型", "货币": "货币型"}.get(key, key)
