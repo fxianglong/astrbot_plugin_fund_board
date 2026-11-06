@@ -20,9 +20,11 @@ def pct(v: float | None) -> str:
     return "--" if v is None else f"{v:+.2f}%"
 
 
-def render_board(s: Summary, show_amount: bool = True, now: datetime | None = None) -> str:
+def render_board(
+    s: Summary, show_amount: bool = True, now: datetime | None = None, title: str = "📊 持仓看板"
+) -> str:
     now = now or datetime.now(CN_TZ)
-    lines = [f"📊 持仓看板  {now:%m-%d %H:%M}", "──────────"]
+    lines = [f"{title}  {now:%m-%d %H:%M}", "──────────"]
     for i, r in enumerate(s.rows, 1):
         lines.append(f"{i}. {r.name}（{r.code}）")
         if r.market_value is None:
@@ -62,14 +64,40 @@ def render_list(holdings, show_amount: bool = True) -> str:
     return "\n".join(lines)
 
 
+def render_trades(trades, show_amount: bool = True) -> str:
+    if not trades:
+        return "还没有交易记录。用 /fund buy、/fund sell 记录加仓和赎回。"
+    lines = ["🧾 最近交易"]
+    for t in trades:
+        day = datetime.fromtimestamp(t.ts, CN_TZ).strftime("%m-%d")
+        kind = "买入" if t.kind == "buy" else "卖出"
+        if show_amount:
+            extra = f" ｜ 实现盈亏 {t.realized:+,.2f}" if t.kind == "sell" else ""
+            lines.append(f"{day} {kind} {t.name}（{t.code}） 金额 {t.amount:,.2f} ｜ 份额 {t.shares:,.2f} ｜ 净值 {t.nav}{extra}")
+        else:
+            lines.append(f"{day} {kind} {t.name}（{t.code}）")
+    return "\n".join(lines)
+
+
 HELP = """📊 基金持仓看板 指令
+【持仓】
 /fund board        持仓看板（别名 /fund 看板）
-/fund list         查看持仓明细
+/fund list         持仓明细
 /fund add 代码 持有金额 [持有收益]
-                   例：/fund add 016370 41200 -23500
-                   金额和收益照抄 App 持仓页即可，份额按最新净值自动换算
+                   例：/fund add 016370 41200 -23500（照抄 App 持仓页）
 /fund del 代码     删除一只
 /fund clear        清空全部持仓
-/fund info 代码    查看单只基金净值与阶段收益
-/fund import       截图一键导入（支付宝/天天基金/银行 App 持仓页）
+/fund import       截图一键导入
+【交易】
+/fund buy 代码 金额 [净值]     记录加仓，不填净值按最新净值
+/fund sell 代码 份额|全部 [净值] 记录赎回，按平均成本计算实现盈亏
+/fund trades [代码]            最近交易记录
+【推送与提醒】
+/fund push on|off  在当前会话开启/关闭每日推送
+/fund push now     立即推送一次日报（测试用）
+/fund alert        查看提醒设置
+/fund alert day 3  组合单日跌幅超过 3% 时提醒（0 关闭）
+/fund alert dd 20  组合或单只基金回撤超过 20% 时提醒（0 关闭）
+【其他】
+/fund info 代码    单只基金净值与阶段收益
 /fund help         显示本帮助"""

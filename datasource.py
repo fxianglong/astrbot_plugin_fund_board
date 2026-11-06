@@ -74,6 +74,7 @@ class FundDataSource:
         self._fund_list: list[FundMeta] | None = None
         self._fund_map: dict[str, FundMeta] = {}
         self._list_lock = asyncio.Lock()
+        self._pz_cache: dict[str, tuple[str, str]] = {}  # code -> (日期, 脚本内容)
 
     # ------------------------------------------------------------------ HTTP
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -201,6 +202,37 @@ class FundDataSource:
             out[label] = _num(m.group(1)) if m else None
         return out
 
-    async def get_period_returns(self, code: str) -> dict[str, float | None]:
+    async def _get_pingzhong(self, code: str) -> str:
+        """单只基金详情脚本，按天缓存（阶段收益和走势一天内不会变）。"""
+        day = time.strftime("%Y%m%d")
+        hit = self._pz_cache.get(code)
+        if hit and hit[0] == day:
+            return hit[1]
         text = await self._fetch_text(PINGZHONG_URL.format(code=code), params={"v": int(time.time())})
-        return self.parse_period_returns(text)
+        self._pz_cache[code] = (day, text)
+        return text
+
+    async def get_period_returns(self, code: str) -> dict[str, float | None]:
+        return self.parse_period_returns(await self._get_pingzhong(code))
+
+    # ------------------------------------------------------------ 净值走势
+    @staticmethod
+    def parse_ac_trend(text: str) -> list[tuple[int, float]]:
+        """累计净值走势 [(毫秒时间戳, 累计净值)]。用累计净值算回撤，避免分红造成的假下跌。"""
+        m = re.search(r"var\s+Data_ACWorthTrend\s*=\s*(\[.*?\])\s*;", text, re.S)
+        if not m:
+            return []
+        try:
+            rows = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            return []
+        out = []
+        for r in rows:
+            if isinstance(r, list) and len(r) >= 2 and r[1] is not None:
+                v = _num(r[1])
+                if v is not None:
+                    out.append((int(r[0]), v))
+        return out
+
+    async def get_ac_trend(self, code: str) -> list[tuple[int, float]]:
+        return self.parse_ac_trend(await self._get_pingzhong(code))

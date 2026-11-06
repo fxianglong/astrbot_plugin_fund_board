@@ -21,5 +21,35 @@
     "description": "行情接口超时（秒）",
     "type": "int",
     "default": 10
+  },
+  "close_push_time": {
+    "description": "收盘估值推送时间",
+    "type": "string",
+    "default": "15:05",
+    "hint": "北京时间，格式 HH:MM。交易日该时间推送按盘中估值计算的看板。"
+  },
+  "nav_push_time": {
+    "description": "净值日报推送时间",
+    "type": "string",
+    "default": "21:30",
+    "hint": "北京时间。从该时间起检查净值是否公布，出齐后推送净值日报和回撤提醒；没出齐每 30 分钟重试。"
+  },
+  "nav_retry_until": {
+    "description": "净值日报最晚等待到",
+    "type": "string",
+    "default": "23:30",
+    "hint": "到这个时间仍有基金净值没公布，就用已公布的部分推送。"
+  },
+  "default_day_alert": {
+    "description": "默认单日跌幅提醒阈值（%）",
+    "type": "float",
+    "default": 3.0,
+    "hint": "用户没有自己设置时使用。0 表示关闭。"
+  },
+  "default_dd_alert": {
+    "description": "默认回撤提醒阈值（%）",
+    "type": "float",
+    "default": 20.0,
+    "hint": "组合和单只基金回撤超过该值时提醒，之后每加深 5 个百分点再提醒一次。0 表示关闭。"
   }
 }
