@@ -79,6 +79,74 @@ def render_trades(trades, show_amount: bool = True) -> str:
     return "\n".join(lines)
 
 
+def _short(name: str, n: int = 12) -> str:
+    return name if len(name) <= n else name[: n - 1] + "…"
+
+
+def render_overlap(a, show_amount: bool = True) -> str:
+    if not a.funds:
+        return "还没有持仓。"
+    lines = ["🔍 重仓股穿透与重叠分析"]
+    if a.report_dates:
+        lines.append(f"数据来源：基金季报前十大重仓股（最新截至 {a.report_dates[0]}），覆盖组合约 {a.disclosed_pct:.0f}% 的市值")
+    lines.append("")
+    lines.append("【穿透后个股暴露 Top 10】")
+    if not a.stocks:
+        lines.append("没有取到重仓股数据（债券、货币基金没有股票持仓）")
+    for k, e in enumerate(a.stocks[:10], 1):
+        amt = f"{e.amount:,.0f} 元｜" if show_amount else ""
+        lines.append(f"{k}. {e.name}  {amt}占组合 {e.pct:.1f}%｜{len(e.funds)} 只基金持有")
+    lines.append("")
+    lines.append("【行业分布（占已披露重仓股）】")
+    for e in a.industries[:6]:
+        lines.append(f"{e.name} {e.pct:.0f}%")
+    lines.append("")
+    lines.append("【基金两两重叠度】")
+    if not a.pairs:
+        lines.append("各基金的前十大重仓股没有重合")
+    for p in a.pairs[:6]:
+        lines.append(f"{_short(p.a)} × {_short(p.b)}：{p.overlap:.1f}%（共同：{'、'.join(p.common[:4])}{'等' if len(p.common) > 4 else ''}）")
+    lines.append("重叠度 = 共同重仓股在两只基金里占净值比例的较小值之和。")
+    return "\n".join(lines)
+
+
+def render_check(a, summary, show_amount: bool = True) -> str:
+    if not a.funds:
+        return "还没有持仓。"
+    lines = ["🩺 组合体检"]
+    head = f"{len(a.funds)} 只基金｜有效基金数 {a.effective_funds:.1f}"
+    if show_amount:
+        head += f"｜市值 {summary.market_value:,.0f}｜累计 {summary.total_profit:+,.0f}（{pct(summary.total_pct)}）"
+    lines.append(head)
+    lines.append("")
+    lines.append("【发现】")
+    lines.extend(f"• {f}" for f in a.flags) if a.flags else lines.append("• 没有发现明显的集中或重叠情况")
+    lines.append("")
+    lines.append("【持仓结构】")
+    lines.append("类型：" + "｜".join(f"{t} {v:.0f}%" for t, v in a.type_mix))
+    if a.industries:
+        lines.append("行业：" + "｜".join(f"{e.name} {e.pct:.0f}%" for e in a.industries[:4]))
+    if a.stocks:
+        lines.append("个股：" + "｜".join(f"{e.name} {e.pct:.1f}%" for e in a.stocks[:4]))
+    lines.append("")
+    lines.append("【单只基金】")
+    for f in a.funds:
+        parts = [f"占 {f.weight:.0f}%"]
+        if f.return_1y is not None:
+            parts.append(f"近1年 {f.return_1y:+.1f}%")
+        if f.drawdown_1y is not None:
+            parts.append(f"回撤 {f.drawdown_1y:.0f}%")
+        if f.stock_ratio is not None:
+            parts.append(f"股票仓位 {f.stock_ratio:.0f}%")
+        if f.managers:
+            name, days = max(f.managers, key=lambda m: m[1])
+            parts.append(f"经理 {name} {days / 365:.1f}年")
+        lines.append(f"{_short(f.name, 14)}：" + "｜".join(parts))
+    lines.append("")
+    lines.append("说明：穿透只基于季报前十大重仓股；回撤为近一年累计净值较高点。" + DISCLAIMER)
+    return "\n".join(lines)
+
+
 HELP = """📊 基金持仓看板 指令
 【持仓】
 /fund board        持仓看板（别名 /fund 看板）
@@ -98,6 +166,10 @@ HELP = """📊 基金持仓看板 指令
 /fund alert        查看提醒设置
 /fund alert day 3  组合单日跌幅超过 3% 时提醒（0 关闭）
 /fund alert dd 20  组合或单只基金回撤超过 20% 时提醒（0 关闭）
+【分析】
+/fund overlap      重仓股穿透与基金重叠分析
+/fund check        组合体检（集中度、行业、回撤、经理）
+/fund board img    图片版看板（check img 同理）
 【其他】
 /fund info 代码    单只基金净值与阶段收益
 /fund help         显示本帮助"""
