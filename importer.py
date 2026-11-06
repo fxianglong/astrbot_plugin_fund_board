@@ -257,7 +257,7 @@ def render_draft(draft: list[DraftItem], show_amount: bool = True) -> str:
     if show_amount:
         lines.append(f"合计 金额 {total_amount:,.0f} ｜ 收益 {total_profit:+,.0f}（请和 App 总数核对）")
     lines.append(
-        "回复：确认（合并到现有持仓）｜确认覆盖（清空后导入）｜取消\n"
+        "回复：确认（合并到现有持仓）｜确认覆盖（清空后导入）｜确认更新（对比现有持仓，自动记录买卖）｜取消\n"
         "修改：删 N ｜ 加 N ｜ 改 N 金额 30000 ｜ 改 N 收益 -2000 ｜ 改 N 代码 016370"
     )
     return "\n".join(lines)
@@ -316,3 +316,69 @@ def apply_edit(draft: list[DraftItem], text: str, matcher: FundMatcher) -> str |
             d.shares = num
         return ""
     return None
+
+
+# ---------------------------------------------------------------- 截图对比生成交易
+@dataclass
+class Change:
+    code: str
+    name: str
+    kind: str  # new 新买入 / buy 加仓 / sell 减仓 / same 无变化
+    shares: float  # 变化的份额（正数）
+    amount: float  # 买入金额或卖出所得
+    nav: float
+    realized: float  # 卖出实现盈亏
+    new_shares: float
+    new_cost: float
+
+
+def diff_holdings(old: dict, rows: list[FinalRow], navs: dict[str, float], tol: float = 0.005):
+    """对比现有持仓和截图识别结果。
+
+    old: code -> 持仓（需有 shares、cost、name）；rows: 截图换算后的行；navs: code -> 最新净值。
+    份额变化小于 tol（默认 0.5%）视为没变，只同步数字。
+    返回 (变化列表, 现有持仓里有但截图里没有的持仓)。
+    """
+    changes: list[Change] = []
+    seen = set()
+    for r in rows:
+        seen.add(r.code)
+        nav = navs.get(r.code) or (r.amount / r.shares if r.shares else 0.0)
+        h = old.get(r.code)
+        if h is None:
+            changes.append(Change(r.code, r.name, "new", r.shares, r.cost, nav, 0.0, r.shares, r.cost))
+            continue
+        ds = r.shares - h.shares
+        if h.shares <= 0 or abs(ds) / h.shares < tol:
+            changes.append(Change(r.code, r.name, "same", 0.0, 0.0, nav, 0.0, r.shares, r.cost))
+        elif ds > 0:
+            amount = r.cost - h.cost if r.cost > h.cost else ds * nav
+            changes.append(Change(r.code, r.name, "buy", ds, amount, nav, 0.0, r.shares, r.cost))
+        else:
+            sold = -ds
+            amount = sold * nav
+            realized = amount - h.cost * sold / h.shares
+            changes.append(Change(r.code, r.name, "sell", sold, amount, nav, realized, r.shares, r.cost))
+    missing = [h for c, h in old.items() if c not in seen]
+    return changes, missing
+
+
+def render_changes(changes: list[Change], missing: list, show_amount: bool = True) -> str:
+    kinds = {"new": "新买入", "buy": "加仓", "sell": "减仓"}
+    moved = [c for c in changes if c.kind != "same"]
+    lines = [f"✅ 已按截图更新 {len(changes)} 只基金，生成 {len(moved)} 笔交易记录。"]
+    for c in moved:
+        if show_amount:
+            extra = f"｜实现盈亏 {c.realized:+,.2f}" if c.kind == "sell" else ""
+            lines.append(f"· {kinds[c.kind]} {c.name}：{c.shares:,.2f} 份，约 {c.amount:,.2f} 元{extra}")
+        else:
+            lines.append(f"· {kinds[c.kind]} {c.name}")
+    same = len(changes) - len(moved)
+    if same:
+        lines.append(f"另有 {same} 只份额没有变化，已同步金额和成本。")
+    if missing:
+        lines.append("")
+        lines.append("以下基金在截图里没有出现，持仓暂时保留。如果已经全部卖出，请发送对应指令：")
+        lines.extend(f"· {h.name}：/fund sell {h.code} 全部" for h in missing)
+    lines.append("交易按最新净值估算，实际以基金公司确认为准。发送 /fund trades 查看记录。")
+    return "\n".join(lines)

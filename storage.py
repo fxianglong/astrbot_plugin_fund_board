@@ -79,6 +79,10 @@ class Storage:
                 user_id TEXT NOT NULL, date TEXT NOT NULL, idx REAL NOT NULL,
                 PRIMARY KEY (user_id, date));
             -- 回撤提醒的已提醒档位，避免每天重复提醒同一档
+            -- 每只基金最近一次推送过的净值日期，用于 QDII 等延迟公布净值的补推
+            CREATE TABLE IF NOT EXISTS reported (
+                user_id TEXT NOT NULL, code TEXT NOT NULL, nav_date TEXT NOT NULL,
+                PRIMARY KEY (user_id, code));
             CREATE TABLE IF NOT EXISTS alert_state (
                 user_id TEXT NOT NULL, scope TEXT NOT NULL, level INTEGER NOT NULL,
                 PRIMARY KEY (user_id, scope));
@@ -169,6 +173,19 @@ class Storage:
                 )
             tid = self._add_trade(user_id, code, h.name, "sell", amount, shares, nav, realized)
         return self.get(user_id, code), self.get_trade(tid)
+
+    def apply_changes(self, user_id: str, changes) -> None:
+        """按截图对比结果写入交易记录，并把持仓同步成截图里的数字。"""
+        with self.conn:
+            for c in changes:
+                if c.kind in ("new", "buy"):
+                    self._add_trade(user_id, c.code, c.name, "buy", c.amount, c.shares, c.nav, 0.0)
+                elif c.kind == "sell":
+                    self._add_trade(user_id, c.code, c.name, "sell", c.amount, c.shares, c.nav, c.realized)
+                self.conn.execute(
+                    _UPSERT_HOLDING,
+                    (user_id, c.code, c.name, round(c.new_shares, 4), round(c.new_cost, 2), time.time()),
+                )
 
     def _add_trade(self, user_id, code, name, kind, amount, shares, nav, realized) -> int:
         cur = self.conn.execute(
@@ -269,6 +286,19 @@ class Storage:
 
     def index_days(self, user_id: str) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM pindex WHERE user_id=?", (user_id,)).fetchone()[0]
+
+    # ------------------------------------------------------------ 净值补推
+    def get_reported(self, user_id: str) -> dict[str, str]:
+        rows = self.conn.execute("SELECT code, nav_date FROM reported WHERE user_id=?", (user_id,)).fetchall()
+        return dict(rows)
+
+    def set_reported(self, user_id: str, items: dict[str, str]) -> None:
+        with self.conn:
+            self.conn.executemany(
+                "INSERT INTO reported (user_id, code, nav_date) VALUES (?,?,?) "
+                "ON CONFLICT(user_id, code) DO UPDATE SET nav_date=excluded.nav_date",
+                [(user_id, c, d) for c, d in items.items()],
+            )
 
     # ------------------------------------------------------------ 提醒档位
     def get_alert_level(self, user_id: str, scope: str) -> int:
