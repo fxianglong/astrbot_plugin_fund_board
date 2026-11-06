@@ -39,6 +39,7 @@ class WeekReport:
     total_profit: float
     total_pct: float | None
     flags: list[str] = field(default_factory=list)
+    benches: list[tuple[str, float | None]] = field(default_factory=list)  # [(基准名, 本周涨跌%)]
 
 
 def week_info(now: datetime) -> tuple[datetime, str]:
@@ -141,6 +142,9 @@ def llm_prompt(r: WeekReport, show_amount: bool) -> str:
         lines.append(f"组合本周涨跌：{r.ret:+.2f}%" + (f"，盈亏 {r.pnl:+,.0f} 元" if show_amount else ""))
     if r.daily:
         lines.append("每日：" + "，".join(f"{d[5:]} {v:+.2f}%" for d, v in r.daily))
+    for n, v in r.benches:
+        if v is not None:
+            lines.append(f"同期{n}：{v:+.2f}%")
     for f in r.funds:
         if f.ret is None:
             lines.append(f"- {f.name}：本周暂无净值")
@@ -167,6 +171,9 @@ def render_weekly(r: WeekReport, show_amount: bool, commentary: str = "") -> str
         if show_amount:
             head += f"｜盈亏 {r.pnl:+,.0f}（按当前持仓估算）"
         lines.append(head)
+    bench_txt = "｜".join(f"{n} {v:+.2f}%" for n, v in r.benches if v is not None)
+    if bench_txt:
+        lines.append(f"同期基准：{bench_txt}")
     if r.daily:
         days = []
         for d, v in r.daily:
@@ -191,7 +198,7 @@ def render_weekly(r: WeekReport, show_amount: bool, commentary: str = "") -> str
         lines.append("──────────")
         lines.append(f"本周交易 {len(r.trades)} 笔" + (f"，已实现盈亏 {r.realized:+,.2f}" if show_amount and r.realized else ""))
         for t in r.trades[:5]:
-            kind = "买入" if t.kind == "buy" else "卖出"
+            kind = {"buy": "买入", "sell": "卖出", "init": "录入", "adjust": "成本调整", "remove": "移除"}.get(t.kind, t.kind)
             lines.append(f"· {kind} {t.name}" + (f" {t.amount:,.0f}" if show_amount else ""))
     if r.flags:
         lines.append("──────────")

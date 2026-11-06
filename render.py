@@ -64,14 +64,19 @@ def render_list(holdings, show_amount: bool = True) -> str:
     return "\n".join(lines)
 
 
+TRADE_KINDS = {"buy": "买入", "sell": "卖出", "init": "录入", "adjust": "成本调整", "remove": "移除"}
+
+
 def render_trades(trades, show_amount: bool = True) -> str:
     if not trades:
         return "还没有交易记录。用 /fund buy、/fund sell 记录加仓和赎回。"
     lines = ["🧾 最近交易"]
     for t in trades:
         day = datetime.fromtimestamp(t.ts, CN_TZ).strftime("%m-%d")
-        kind = "买入" if t.kind == "buy" else "卖出"
-        if show_amount:
+        kind = TRADE_KINDS.get(t.kind, t.kind)
+        if show_amount and t.kind in ("init", "adjust"):
+            lines.append(f"{day} {kind} {t.name}（{t.code}） 金额 {t.amount:+,.2f}")
+        elif show_amount:
             extra = f" ｜ 实现盈亏 {t.realized:+,.2f}" if t.kind == "sell" else ""
             lines.append(f"{day} {kind} {t.name}（{t.code}） 金额 {t.amount:,.2f} ｜ 份额 {t.shares:,.2f} ｜ 净值 {t.nav}{extra}")
         else:
@@ -171,6 +176,8 @@ HELP = """📊 基金持仓看板 指令
 /fund check        组合体检（集中度、行业、回撤、经理）
 /fund board img    图片版看板（check img 同理）
 /fund weekly       本周周报（含 AI 点评）
+/fund perf [区间] [img]  收益表现：时间加权、XIRR 年化、与沪深300/纳指100对比
+                   区间：近1月 近3月 近6月 近1年 今年 全部
 【其他】
 /fund info 代码    单只基金净值与阶段收益
 /fund help         显示本帮助

@@ -229,3 +229,96 @@ def check_data(a, summary, show_amount: bool, now: datetime | None = None) -> di
         stocks=_bars([(e.name, e.pct) for e in a.stocks[:8]], "{:.1f}%"),
         pairs=pairs, funds=funds, notes=notes,
     )
+
+
+# ---------------------------------------------------------------- 收益表现
+PERF_TMPL = (
+    "<html><head><meta charset='utf-8'><style>"
+    + BASE_CSS
+    + """
+.legend { display: flex; gap: 18px; font-size: 13px; color: #646a73; margin-top: 8px; }
+.legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+.brow { display: flex; justify-content: space-between; font-size: 15px; padding: 9px 0; border-top: 1px solid #f0f1f3; }
+.brow:first-of-type { border-top: none; }
+</style></head><body>
+<div class="card">
+  <div class="head"><div class="title">📈 收益表现 · {{ range }}</div><div class="time">{{ time }}</div></div>
+  <div class="kpis">
+    <div class="kpi"><div class="l">组合涨跌（时间加权）</div><div class="v {{ twr_cls }}">{{ twr }}</div></div>
+    <div class="kpi"><div class="l">年化（XIRR）</div><div class="v {{ xirr_cls }}">{{ xirr }}</div></div>
+    <div class="kpi"><div class="l">区间最大回撤</div><div class="v">{{ mdd }}</div></div>
+  </div>
+</div>
+{% if svg %}
+<div class="card"><div class="sec">组合与基准走势 <span class="small">区间起点 = 1</span></div>
+  {{ svg | safe }}
+  <div class="legend">{% for l in legend %}<span><i style="background: {{ l.color }}"></i>{{ l.name }}</span>{% endfor %}</div>
+</div>
+{% endif %}
+<div class="card"><div class="sec">同期基准</div>
+  {% for b in benches %}<div class="brow"><span>{{ b.name }}<span class="small">　{{ b.code }}</span></span><span class="{{ b.cls }}">{{ b.ret }}　<span class="small">{{ b.diff }}</span></span></div>{% endfor %}
+  {% if show_amount and profit %}<div class="brow"><span>区间盈亏</span><span class="{{ profit_cls }}">{{ profit }}</span></div>{% endif %}
+</div>
+<div class="foot">{% for n in notes %}{{ n }}<br>{% endfor %}</div>
+</body></html>"""
+)
+
+LINE_COLORS = ["#3b6fd8", "#f59e0b", "#8b5cf6", "#10b981"]
+
+
+def _svg_lines(series: list[list[float]], width: int = 680, height: int = 220) -> str:
+    vals = [v for s in series for v in s]
+    if not vals or max(len(s) for s in series) < 2:
+        return ""
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-9:
+        hi, lo = hi + 0.01, lo - 0.01
+    pad = (hi - lo) * 0.08
+    lo, hi = lo - pad, hi + pad
+    n = max(len(s) for s in series)
+
+    def xy(i, v):
+        return 40 + i * (width - 50) / (n - 1), 10 + (hi - v) / (hi - lo) * (height - 30)
+
+    parts = [f'<svg width="{width}" height="{height}" xmlns="http://www.w3.org/2000/svg">']
+    for k in range(5):  # 横向网格和刻度
+        v = lo + (hi - lo) * k / 4
+        _, y = xy(0, v)
+        parts.append(f'<line x1="40" x2="{width - 10}" y1="{y:.1f}" y2="{y:.1f}" stroke="#eef0f3"/>')
+        parts.append(f'<text x="0" y="{y + 4:.1f}" font-size="11" fill="#8f959e">{v:.2f}</text>')
+    _, y1 = xy(0, 1.0)
+    if lo < 1.0 < hi:
+        parts.append(f'<line x1="40" x2="{width - 10}" y1="{y1:.1f}" y2="{y1:.1f}" stroke="#c9cdd4" stroke-dasharray="4 4"/>')
+    for idx, s in enumerate(series):
+        pts = " ".join(f"{x:.1f},{y:.1f}" for x, y in (xy(i, v) for i, v in enumerate(s)))
+        w = 3 if idx == 0 else 2
+        parts.append(f'<polyline points="{pts}" fill="none" stroke="{LINE_COLORS[idx % 4]}" stroke-width="{w}" stroke-linejoin="round"/>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def perf_data(p, show_amount: bool, now: datetime | None = None) -> dict:
+    now = now or datetime.now(CN_TZ)
+    series = [[v for _, v in p.curve]] if p.curve else []
+    legend = [dict(name="我的组合", color=LINE_COLORS[0])] if p.curve else []
+    for k, (name, curve) in enumerate(p.bench_curves.items(), 1):
+        series.append([v for _, v in curve])
+        legend.append(dict(name=name, color=LINE_COLORS[k % 4]))
+    benches = []
+    for b in p.benches:
+        diff = ""
+        if b.ret is not None and p.twr is not None:
+            d = p.twr - b.ret
+            diff = f"组合{'跑赢' if d >= 0 else '跑输'} {abs(d):.2f} 个百分点"
+        benches.append(dict(name=b.name, code=b.code, ret=_pct(b.ret), cls=_cls(b.ret), diff=diff))
+    notes = []
+    if p.start:
+        notes.append(f"区间 {p.start} 起，共 {p.days} 个记录日。年化需要至少 30 天的记录。")
+    notes.append("基准以指数联接基金的累计净值近似。收益从开始在插件里记录时算起。仅供参考，不构成投资建议。")
+    return dict(
+        range=p.range_name, time=now.strftime("%Y-%m-%d %H:%M"), show_amount=show_amount,
+        twr=_pct(p.twr), twr_cls=_cls(p.twr), xirr=_pct(p.xirr), xirr_cls=_cls(p.xirr),
+        mdd=f"{p.mdd:.2f}%" if p.mdd is not None else "--",
+        svg=_svg_lines(series) if series else "", legend=legend, benches=benches,
+        profit=_money(p.profit, True) if p.profit is not None else "", profit_cls=_cls(p.profit), notes=notes,
+    )

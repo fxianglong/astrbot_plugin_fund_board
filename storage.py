@@ -40,7 +40,7 @@ class Trade:
     user_id: str
     code: str
     name: str
-    kind: str  # buy / sell
+    kind: str  # buy / sell / init（录入）/ adjust（成本调整）/ remove（移除）
     amount: float  # 买入金额或卖出所得
     shares: float
     nav: float
@@ -79,6 +79,11 @@ class Storage:
                 user_id TEXT NOT NULL, date TEXT NOT NULL, idx REAL NOT NULL,
                 PRIMARY KEY (user_id, date));
             -- 回撤提醒的已提醒档位，避免每天重复提醒同一档
+            CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            -- 每日快照：每个交易日记录一次组合市值和成本，用于计算区间收益和 XIRR
+            CREATE TABLE IF NOT EXISTS snapshots (
+                user_id TEXT NOT NULL, date TEXT NOT NULL, mv REAL NOT NULL, cost REAL NOT NULL,
+                PRIMARY KEY (user_id, date));
             -- 每只基金最近一次推送过的净值日期，用于 QDII 等延迟公布净值的补推
             CREATE TABLE IF NOT EXISTS reported (
                 user_id TEXT NOT NULL, code TEXT NOT NULL, nav_date TEXT NOT NULL,
@@ -92,25 +97,108 @@ class Storage:
         self.conn.commit()
 
     def _migrate(self) -> None:
-        """旧版本数据库补字段。"""
+        """旧版本数据库补字段、补数据。"""
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(settings)").fetchall()}
         if "last_weekly" not in cols:
             self.conn.execute("ALTER TABLE settings ADD COLUMN last_weekly TEXT NOT NULL DEFAULT ''")
+        if not self.get_meta("flows_v1"):
+            self._backfill_init_flows()
+            self.set_meta("flows_v1", "1")
 
-    # ------------------------------------------------------------ 持仓
-    def upsert(self, user_id: str, code: str, name: str, shares: float, cost: float) -> None:
-        self.conn.execute(_UPSERT_HOLDING, (user_id, code, name, round(shares, 4), round(cost, 2), time.time()))
+    def _backfill_init_flows(self) -> None:
+        """v0.5 之前录入的持仓没有现金流记录，按「成本 − 买入 + 卖出扣减的成本」补一笔 init。"""
+        for h in self.conn.execute(
+            "SELECT user_id, code, name, shares, cost, updated_at FROM holdings"
+        ).fetchall():
+            h = Holding(*h)
+            rows = self.conn.execute(
+                "SELECT kind, amount, realized, ts FROM trades WHERE user_id=? AND code=?", (h.user_id, h.code)
+            ).fetchall()
+            buys = sum(a for k, a, _, _ in rows if k == "buy")
+            sold_cost = sum(a - r for k, a, r, _ in rows if k == "sell")
+            amount = h.cost - buys + sold_cost
+            if amount <= 0.01:
+                continue
+            ts = min([h.updated_at] + [t for *_, t in rows]) - 1
+            self.conn.execute(
+                "INSERT INTO trades (user_id, code, name, kind, amount, shares, nav, realized, ts) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (h.user_id, h.code, h.name, "init", round(amount, 2), 0.0, 0.0, 0.0, ts),
+            )
+
+    def get_meta(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
         self.conn.commit()
 
-    def upsert_many(self, user_id: str, rows: list[tuple[str, str, float, float]], replace_all: bool = False) -> None:
-        """rows: [(code, name, shares, cost)]。replace_all=True 时先清空该用户的持仓。"""
+    # ------------------------------------------------------------ 每日快照
+    def record_snapshot(self, user_id: str, date: str, market_value: float, cost: float) -> None:
+        self.conn.execute(
+            "INSERT INTO snapshots (user_id, date, mv, cost) VALUES (?,?,?,?) "
+            "ON CONFLICT(user_id, date) DO UPDATE SET mv=excluded.mv, cost=excluded.cost",
+            (user_id, date, round(market_value, 2), round(cost, 2)),
+        )
+        self.conn.commit()
+
+    def snapshots(self, user_id: str) -> list[tuple[str, float]]:
+        return self.conn.execute(
+            "SELECT date, mv FROM snapshots WHERE user_id=? ORDER BY date", (user_id,)
+        ).fetchall()
+
+    def index_all(self, user_id: str) -> list[tuple[str, float]]:
+        return self.conn.execute(
+            "SELECT date, idx FROM pindex WHERE user_id=? ORDER BY date", (user_id,)
+        ).fetchall()
+
+    def all_user_ids(self) -> list[str]:
+        return [r[0] for r in self.conn.execute("SELECT DISTINCT user_id FROM holdings").fetchall()]
+
+    # ------------------------------------------------------------ 持仓
+    def _flow_for_set(self, user_id: str, code: str, name: str, cost: float, nav: float | None) -> None:
+        """直接设置持仓时补一笔现金流：新持仓记 init（金额=成本），已有持仓成本变化记 adjust。"""
+        old = self.get(user_id, code)
+        if old is None:
+            if cost > 0.01:
+                self._add_trade(user_id, code, name, "init", cost, 0.0, nav or 0.0, 0.0)
+        elif abs(cost - old.cost) > 0.01:
+            self._add_trade(user_id, code, name, "adjust", cost - old.cost, 0.0, nav or 0.0, 0.0)
+
+    def _flow_for_remove(self, h: Holding, nav: float | None) -> None:
+        """移除持仓视为按当前市值取出（没有净值时按成本）。"""
+        amount = h.shares * nav if nav else h.cost
+        self._add_trade(h.user_id, h.code, h.name, "remove", amount, h.shares, nav or 0.0, 0.0)
+
+    def upsert(self, user_id: str, code: str, name: str, shares: float, cost: float, nav: float | None = None) -> None:
+        with self.conn:
+            self._flow_for_set(user_id, code, name, cost, nav)
+            self.conn.execute(_UPSERT_HOLDING, (user_id, code, name, round(shares, 4), round(cost, 2), time.time()))
+
+    def upsert_many(
+        self,
+        user_id: str,
+        rows: list[tuple[str, str, float, float]],
+        replace_all: bool = False,
+        navs: dict[str, float] | None = None,
+    ) -> None:
+        """rows: [(code, name, shares, cost)]。replace_all=True 时先移除截图里没有的持仓。"""
+        navs = navs or {}
         with self.conn:
             if replace_all:
-                self.conn.execute("DELETE FROM holdings WHERE user_id=?", (user_id,))
+                keep = {r[0] for r in rows}
+                for h in self.list(user_id):
+                    if h.code not in keep:
+                        self._flow_for_remove(h, navs.get(h.code))
+                        self.conn.execute("DELETE FROM holdings WHERE user_id=? AND code=?", (user_id, h.code))
             now = time.time()
-            self.conn.executemany(
-                _UPSERT_HOLDING, [(user_id, c, n, round(s, 4), round(cost, 2), now) for c, n, s, cost in rows]
-            )
+            for c, n, sh, cost in rows:
+                self._flow_for_set(user_id, c, n, cost, navs.get(c))
+                self.conn.execute(_UPSERT_HOLDING, (user_id, c, n, round(sh, 4), round(cost, 2), now))
 
     def get(self, user_id: str, code: str) -> Holding | None:
         row = self.conn.execute(
@@ -119,15 +207,23 @@ class Storage:
         ).fetchone()
         return Holding(*row) if row else None
 
-    def delete(self, user_id: str, code: str) -> bool:
-        cur = self.conn.execute("DELETE FROM holdings WHERE user_id=? AND code=?", (user_id, code))
-        self.conn.commit()
-        return cur.rowcount > 0
+    def delete(self, user_id: str, code: str, nav: float | None = None) -> bool:
+        h = self.get(user_id, code)
+        if not h:
+            return False
+        with self.conn:
+            self._flow_for_remove(h, nav)
+            self.conn.execute("DELETE FROM holdings WHERE user_id=? AND code=?", (user_id, code))
+        return True
 
-    def clear(self, user_id: str) -> int:
-        cur = self.conn.execute("DELETE FROM holdings WHERE user_id=?", (user_id,))
-        self.conn.commit()
-        return cur.rowcount
+    def clear(self, user_id: str, navs: dict[str, float] | None = None) -> int:
+        navs = navs or {}
+        hs = self.list(user_id)
+        with self.conn:
+            for h in hs:
+                self._flow_for_remove(h, navs.get(h.code))
+            self.conn.execute("DELETE FROM holdings WHERE user_id=?", (user_id,))
+        return len(hs)
 
     def list(self, user_id: str) -> list[Holding]:
         cur = self.conn.execute(
@@ -178,10 +274,16 @@ class Storage:
         """按截图对比结果写入交易记录，并把持仓同步成截图里的数字。"""
         with self.conn:
             for c in changes:
+                old = self.get(user_id, c.code)
+                expected = old.cost if old else 0.0
                 if c.kind in ("new", "buy"):
                     self._add_trade(user_id, c.code, c.name, "buy", c.amount, c.shares, c.nav, 0.0)
+                    expected += c.amount
                 elif c.kind == "sell":
                     self._add_trade(user_id, c.code, c.name, "sell", c.amount, c.shares, c.nav, c.realized)
+                    expected -= c.amount - c.realized
+                if abs(c.new_cost - expected) > 0.01:  # 截图里的成本和推算的不一致，差额记为调整
+                    self._add_trade(user_id, c.code, c.name, "adjust", c.new_cost - expected, 0.0, c.nav, 0.0)
                 self.conn.execute(
                     _UPSERT_HOLDING,
                     (user_id, c.code, c.name, round(c.new_shares, 4), round(c.new_cost, 2), time.time()),
