@@ -178,6 +178,10 @@ HELP = """📊 基金持仓看板 指令
 /fund weekly       本周周报（含 AI 点评）
 /fund perf [区间] [img]  收益表现：时间加权、XIRR 年化、与沪深300/纳指100对比
                    区间：近1月 近3月 近6月 近1年 今年 全部
+【配置与风险】
+/fund tag [代码 标签]     给基金分组（默认按类型）
+/fund target [分组 比例] [img]  目标比例与偏离，如 /fund target 科技主题 30
+/fund stress [行业 幅度]  情景压力测试，如 /fund stress 通信 -30
 【其他】
 /fund info 代码    单只基金净值与阶段收益
 /fund help         显示本帮助

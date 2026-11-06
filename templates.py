@@ -322,3 +322,51 @@ def perf_data(p, show_amount: bool, now: datetime | None = None) -> dict:
         svg=_svg_lines(series) if series else "", legend=legend, benches=benches,
         profit=_money(p.profit, True) if p.profit is not None else "", profit_cls=_cls(p.profit), notes=notes,
     )
+
+
+# ---------------------------------------------------------------- 目标配置
+TARGET_TMPL = (
+    "<html><head><meta charset='utf-8'><style>"
+    + BASE_CSS
+    + """
+.trow { padding: 12px 0; border-top: 1px solid #f0f1f3; }
+.trow:first-of-type { border-top: none; }
+.tl { display: flex; justify-content: space-between; font-size: 15px; margin-bottom: 6px; }
+.track { position: relative; height: 14px; background: #f0f1f3; border-radius: 7px; }
+.fill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 7px; background: #3b6fd8; }
+.fill.off { background: #f59e0b; }
+.mark { position: absolute; top: -4px; width: 3px; height: 22px; background: #1f2329; border-radius: 2px; }
+</style></head><body>
+<div class="card">
+  <div class="head"><div class="title">🎯 目标配置</div><div class="time">{{ time }}</div></div>
+  {% for r in rows %}
+  <div class="trow">
+    <div class="tl"><span><b>{{ r.group }}</b>　<span class="small">{{ r.funds }}</span></span>
+      <span>{{ r.pct }}{% if r.target %}<span class="small">　目标 {{ r.target }}</span>　<span class="{{ r.cls }}">{{ r.diff }}</span>{% endif %}</span></div>
+    <div class="track"><div class="fill {{ 'off' if r.off else '' }}" style="width: {{ r.w }}%"></div>
+      {% if r.tw is not none %}<div class="mark" style="left: calc({{ r.tw }}% - 1px)"></div>{% endif %}</div>
+  </div>
+  {% endfor %}
+</div>
+<div class="foot">{% for n in notes %}{{ n }}<br>{% endfor %}</div>
+</body></html>"""
+)
+
+
+def target_data(alloc, tolerance: float, now: datetime | None = None) -> dict:
+    now = now or datetime.now(CN_TZ)
+    rows = []
+    for a in alloc:
+        off = a.diff is not None and abs(a.diff) >= tolerance
+        rows.append(dict(
+            group=a.group,
+            funds="、".join(f if len(f) <= 10 else f[:9] + "…" for f in a.funds[:2]) + ("等" if len(a.funds) > 2 else ""),
+            pct=f"{a.pct:.1f}%", w=round(min(a.pct, 100), 1),
+            target=f"{a.target:g}%" if a.target is not None else "",
+            tw=round(min(a.target, 100), 1) if a.target is not None else None,
+            diff=f"{a.diff:+.1f}" if a.diff is not None else "", off=off,
+            cls="up" if off and a.diff > 0 else ("down" if off else "flat"),
+        ))
+    notes = [f"黑色竖线为你设定的目标位置，偏离超过 ±{tolerance:g} 个百分点显示为橙色。",
+             "偏离只对照你自己设定的目标，不构成操作建议。"]
+    return dict(time=now.strftime("%Y-%m-%d %H:%M"), rows=rows, notes=notes)

@@ -29,7 +29,26 @@ from .analysis import analyze
 from .render import DISCLAIMER, HELP, render_board, render_check, render_list, render_overlap, render_trades
 from .storage import Holding, Settings, Storage
 from .perf import RANGE_ALIASES, RANGES, compute_perf, render_perf
-from .templates import BOARD_TMPL, CHECK_TMPL, PERF_TMPL, board_data, check_data, perf_data
+from .planning import (
+    PRESETS,
+    allocation,
+    drift_lines,
+    group_of,
+    parse_scenario,
+    render_alloc,
+    render_stress,
+    stress,
+)
+from .templates import (
+    BOARD_TMPL,
+    CHECK_TMPL,
+    PERF_TMPL,
+    TARGET_TMPL,
+    board_data,
+    check_data,
+    perf_data,
+    target_data,
+)
 from .weekly import (
     SYSTEM_PROMPT,
     build_week,
@@ -52,7 +71,7 @@ PRIVACY_NOTE = "提示：截图会发送给当前配置的大模型服务商识�
 REPORT_TITLES = {"close": "🔔 收盘估值", "nav": "🌙 净值日报", "manual": "📊 持仓日报", "preclose": "⏰ 收盘前估值"}
 
 
-@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.5.0")
+@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.6.0")
 class FundBoard(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -70,6 +89,7 @@ class FundBoard(Star):
         self._qdii_next: datetime | None = None
         self._intra_next: datetime | None = None
         self._intra_levels: dict[tuple[str, str, str], int] = {}
+        self._last_gather: dict[str, tuple] = {}
         self._task = asyncio.create_task(self._scheduler_loop())
 
     # ------------------------------------------------------------ 工具方法
@@ -203,6 +223,25 @@ class FundBoard(Star):
 
     async def _analyze(self, uid: str):
         """取重仓股、经理、走势等数据并做穿透分析（合并全部账户）。返回 (summary, analysis)，没有持仓时返回 None。"""
+        data = await self._gather(uid)
+        if not data:
+            return None
+        summary, hs, ps, dds, types = data
+        self._last_gather[uid] = data
+        return summary, await asyncio.to_thread(analyze, summary, hs, ps, dds, types)
+
+    async def _ftypes(self, codes: list[str]) -> dict[str, str]:
+        out = {}
+        for c in codes:
+            try:
+                meta = await self.ds.get_meta(c)
+            except DataSourceError:
+                meta = None
+            out[c] = meta.ftype if meta else ""
+        return out
+
+    async def _gather(self, uid: str):
+        """取分析需要的全部数据：(summary, 重仓股, 资料, 近一年回撤, 类型)。"""
         holdings = self._merged_holdings(uid)
         if not holdings:
             return None
@@ -236,7 +275,7 @@ class FundBoard(Star):
         ps = {c: p for c, _, p, _, _ in results if p}
         dds = {c: dd for c, _, _, dd, _ in results if dd is not None}
         types = {c: t for c, _, _, _, t in results}
-        return summary, await asyncio.to_thread(analyze, summary, hs, ps, dds, types)
+        return summary, hs, ps, dds, types
 
     @fund.command("overlap", alias={"重叠", "穿透"})
     async def overlap(self, event: AstrMessageEvent):
@@ -286,6 +325,17 @@ class FundBoard(Star):
                 parts.append(f"年化 {p.xirr:+.2f}%")
             parts += [f"{b.name} {b.ret:+.2f}%" for b in p.benches if b.ret is not None]
             text += "\n收益：" + "｜".join(parts) + "（详见 /fund perf）"
+        g = self._last_gather.get(self._base(event))
+        if g:
+            gs, hs, ps, _dds, types = g
+            worst = min((stress(sc, gs.rows, types, hs, ps) for sc in PRESETS), key=lambda r: r.loss)
+            if worst.loss < 0:
+                text += f"\n压力测试：最不利的预设情景「{worst.scenario.name}」下组合约 {worst.pct:+.1f}%（详见 /fund stress）"
+        if self.storage.targets(self._base(event)):
+            alloc = await self._alloc(self._base(event), summary)
+            off = [a2 for a2 in alloc if a2.diff is not None and abs(a2.diff) >= self._tolerance()]
+            if off:
+                text += "\n目标偏离：" + "｜".join(f"{x.group} {x.pct:.0f}%/{x.target:g}%" for x in off)
         yield event.plain_result(text)
 
     @fund.command("list", alias={"持仓"})
@@ -549,6 +599,112 @@ class FundBoard(Star):
             if status == "ok":
                 await self._send(st, text, img, extra)
             self.storage.set_meta(key, today)
+
+    # ------------------------------------------------------------ 标签、目标配置、压力测试（v0.6）
+    def _tolerance(self) -> float:
+        return float(self.config.get("target_tolerance", 5) or 0)
+
+    async def _alloc(self, base: str, summary) -> list:
+        codes = [r.code for r in summary.rows]
+        return allocation(
+            summary.rows, await self._ftypes(codes), self.storage.tags(base), self.storage.targets(base)
+        )
+
+    @fund.command("tag", alias={"标签"})
+    async def tag(self, event: AstrMessageEvent, code: str = "", tag: str = ""):
+        """基金分组标签：/fund tag [代码] [标签|删除]"""
+        base = self._base(event)
+        code = code.strip()
+        if code and not re.fullmatch(r"\d{6}", code):
+            yield event.plain_result("用法：/fund tag 016370 科技主题 ｜ /fund tag 016370 删除 ｜ /fund tag 查看全部")
+            return
+        if code and tag.strip():
+            t = tag.strip()
+            if t in ("删除", "清除", "默认"):
+                self.storage.set_tag(base, code, None)
+                yield event.plain_result(f"已删除 {code} 的自定义标签，恢复按基金类型分组。")
+                return
+            self.storage.set_tag(base, code, t[:12])
+            yield event.plain_result(f"已把 {code} 归入「{t[:12]}」。用 /fund target {t[:12]} 30 可以给这个分组设目标比例。")
+            return
+        holdings = self._merged_holdings(base)
+        if not holdings:
+            yield event.plain_result(render_list([]))
+            return
+        tags = self.storage.tags(base)
+        ftypes = await self._ftypes([h.code for h in holdings])
+        lines = ["🏷️ 基金分组"]
+        for h in holdings:
+            g = group_of(h.code, ftypes.get(h.code, ""), tags)
+            src = "自定义" if h.code in tags else "按类型"
+            lines.append(f"· {h.name}（{h.code}）：{g}（{src}）")
+        lines.append("自定义：/fund tag 代码 标签 ｜ 恢复默认：/fund tag 代码 删除")
+        yield event.plain_result("\n".join(lines))
+
+    @fund.command("target", alias={"目标"})
+    async def target(self, event: AstrMessageEvent, group: str = "", pct: str = "", mode: str = ""):
+        """目标配置：/fund target [分组 比例|删除] [img]"""
+        base = self._base(event)
+        if group.strip().lower() in ("img", "image", "图", "图片", "text", "文字"):
+            group, mode = "", group
+        if group.strip() and pct.strip():
+            g = group.strip()[:12]
+            if pct.strip() in ("删除", "清除"):
+                self.storage.set_target(base, g, None)
+                yield event.plain_result(f"已删除「{g}」的目标。")
+                return
+            v = to_money(pct.strip().rstrip("%"))
+            if v is None or not 0 <= v <= 100:
+                yield event.plain_result("比例请填 0～100 的数字，例如 /fund target 科技主题 30")
+                return
+            self.storage.set_target(base, g, v)
+            total = sum(self.storage.targets(base).values())
+            msg = f"已设定「{g}」目标 {v:g}%。"
+            if total > 100.01:
+                msg += f"\n⚠️ 当前所有目标合计 {total:g}%，超过了 100%。"
+            yield event.plain_result(msg)
+        holdings = self._merged_holdings(base)
+        if not holdings:
+            yield event.plain_result(render_list([]))
+            return
+        try:
+            quotes = await self.ds.get_quotes([h.code for h in holdings])
+        except DataSourceError:
+            yield event.plain_result("获取行情失败，请稍后再试。")
+            return
+        summary = build_summary(holdings, quotes)
+        alloc = await self._alloc(base, summary)
+        show = self._show_amount(event)
+        if self._want_image(mode):
+            path = await self._render_img(TARGET_TMPL, target_data(alloc, self._tolerance()), event.unified_msg_origin)
+            if path:
+                yield event.image_result(path)
+                return
+        yield event.plain_result(render_alloc(alloc, self._tolerance(), show))
+
+    @fund.command("stress", alias={"压力", "压力测试"})
+    async def stress_cmd(self, event: AstrMessageEvent, target: str = "", shock: str = ""):
+        """情景压力测试：/fund stress [行业|美股|A股|债市 幅度]"""
+        if target.strip():
+            sc = parse_scenario(target, shock or "-20")
+            if not sc:
+                yield event.plain_result("用法：/fund stress 通信 -30 ｜ /fund stress 电子,计算机 -20 ｜ /fund stress 美股 -15")
+                return
+            scenarios = [sc]
+        else:
+            scenarios = PRESETS
+        yield event.plain_result("正在获取持仓结构，请稍候…")
+        try:
+            data = await self._gather(self._base(event))
+        except DataSourceError:
+            yield event.plain_result("获取数据失败，请稍后再试。")
+            return
+        if not data:
+            yield event.plain_result(render_list([]))
+            return
+        summary, hs, ps, _dds, types = data
+        results = [stress(sc, summary.rows, types, hs, ps) for sc in scenarios]
+        yield event.plain_result(render_stress(results, self._show_amount(event)))
 
     # ------------------------------------------------------------ 周报
     async def _commentary(self, prompt: str, umo: str | None) -> str:
@@ -907,6 +1063,16 @@ class FundBoard(Star):
                 self.storage, uid, summary, day_th, dd_th, portfolio, fund_dds, dry=(mode == "manual")
             )
             extra.extend(alert_lines)
+            if self.storage.targets(uid) and self._tolerance() > 0:
+                dry = mode == "manual"
+                drift = drift_lines(
+                    await self._alloc(uid, summary),
+                    self._tolerance(),
+                    (lambda sc: 0) if dry else (lambda sc: self.storage.get_alert_level(uid, sc)),
+                    (lambda sc, lv: None) if dry else (lambda sc, lv: self.storage.set_alert_level(uid, sc, lv)),
+                )
+                if drift:
+                    extra.extend(drift + ["偏离只对照你自己设定的目标，不构成操作建议。"])
         extra_text = "\n".join(extra)
         text = render_board(summary, show, now, REPORT_TITLES[mode]) + (f"\n\n{extra_text}" if extra else "")
         img = None
