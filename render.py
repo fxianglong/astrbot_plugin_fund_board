@@ -162,8 +162,8 @@ HELP = """📊 基金持仓看板 指令
 /fund clear        清空全部持仓
 /fund import       截图一键导入
 【交易】
-/fund buy 代码 金额 [净值]     记录加仓，不填净值按最新净值
-/fund sell 代码 份额|全部 [净值] 记录赎回，按平均成本计算实现盈亏
+/fund buy 代码 金额 [净值] [理由]  记录加仓，不填净值按最新净值
+/fund sell 代码 份额|全部 [净值] [理由]  记录赎回，按平均成本计算实现盈亏
 /fund trades [代码]            最近交易记录
 【推送与提醒】
 /fund push on|off  在当前会话开启/关闭每日推送
@@ -182,6 +182,12 @@ HELP = """📊 基金持仓看板 指令
 /fund tag [代码 标签]     给基金分组（默认按类型）
 /fund target [分组 比例] [img]  目标比例与偏离，如 /fund target 科技主题 30
 /fund stress [行业 幅度]  情景压力测试，如 /fund stress 通信 -30
+【复盘与定投】
+/fund buy、/fund sell 末尾可以加一句理由，到期推送复盘
+/fund note 代码 内容  记一笔想法
+/fund review          决策日志和之后的表现
+/fund sip add 代码 金额 规则 [费率]  定投计划，如 /fund sip add 110020 500 每周三
+/fund sip list ｜ stats ｜ pause N ｜ resume N ｜ del N
 【其他】
 /fund info 代码    单只基金净值与阶段收益
 /fund help         显示本帮助

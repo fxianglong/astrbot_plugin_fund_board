@@ -48,6 +48,38 @@ class Trade:
     ts: float
 
 
+@dataclass
+class Note:
+    id: int
+    user_id: str
+    code: str
+    name: str
+    kind: str  # buy / sell / note
+    text: str
+    trade_id: int | None
+    amount: float
+    ts: float
+    reviewed: set[int]
+
+    @staticmethod
+    def from_row(r) -> "Note":
+        return Note(*r[:9], {int(x) for x in r[9].split(",") if x})
+
+
+@dataclass
+class SipPlan:
+    id: int
+    user_id: str
+    code: str
+    name: str
+    amount: float
+    rule: str
+    fee_rate: float
+    active: int
+    created: float
+    last_date: str
+
+
 _UPSERT_HOLDING = """INSERT INTO holdings (user_id, code, name, shares, cost, updated_at)
     VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(user_id, code) DO UPDATE SET
@@ -80,6 +112,16 @@ class Storage:
                 PRIMARY KEY (user_id, date));
             -- 回撤提醒的已提醒档位，避免每天重复提醒同一档
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            -- v0.7 决策日志与定投
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, text TEXT NOT NULL, trade_id INTEGER,
+                amount REAL NOT NULL DEFAULT 0, ts REAL NOT NULL, reviewed TEXT NOT NULL DEFAULT '');
+            CREATE TABLE IF NOT EXISTS sip_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '', amount REAL NOT NULL, rule TEXT NOT NULL,
+                fee_rate REAL NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
+                created REAL NOT NULL, last_date TEXT NOT NULL DEFAULT '');
             -- v0.6 自定义标签与目标比例
             CREATE TABLE IF NOT EXISTS tags (
                 user_id TEXT NOT NULL, code TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY (user_id, code));
@@ -106,6 +148,9 @@ class Storage:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(settings)").fetchall()}
         if "last_weekly" not in cols:
             self.conn.execute("ALTER TABLE settings ADD COLUMN last_weekly TEXT NOT NULL DEFAULT ''")
+        tcols = {r[1] for r in self.conn.execute("PRAGMA table_info(trades)").fetchall()}
+        if "sip_id" not in tcols:
+            self.conn.execute("ALTER TABLE trades ADD COLUMN sip_id INTEGER")
         if not self.get_meta("flows_v1"):
             self._backfill_init_flows()
             self.set_meta("flows_v1", "1")
@@ -238,9 +283,19 @@ class Storage:
         return [Holding(*row) for row in cur.fetchall()]
 
     # ------------------------------------------------------------ 交易
-    def buy(self, user_id: str, code: str, name: str, amount: float, nav: float) -> tuple[Holding, Trade]:
-        """按金额买入：份额 = 金额 ÷ 净值，成本增加买入金额。"""
-        shares = amount / nav
+    def buy(
+        self,
+        user_id: str,
+        code: str,
+        name: str,
+        amount: float,
+        nav: float,
+        fee_rate: float = 0.0,
+        ts: float | None = None,
+        sip_id: int | None = None,
+    ) -> tuple[Holding, Trade]:
+        """按金额买入：份额 = 金额 ÷ (1 + 费率) ÷ 净值，成本增加买入金额。"""
+        shares = amount / (1 + fee_rate / 100) / nav
         with self.conn:
             h = self.get(user_id, code)
             new_shares = (h.shares if h else 0) + shares
@@ -248,7 +303,7 @@ class Storage:
             self.conn.execute(
                 _UPSERT_HOLDING, (user_id, code, name, round(new_shares, 4), round(new_cost, 2), time.time())
             )
-            tid = self._add_trade(user_id, code, name, "buy", amount, shares, nav, 0.0)
+            tid = self._add_trade(user_id, code, name, "buy", amount, shares, nav, 0.0, ts=ts, sip_id=sip_id)
         return self.get(user_id, code), self.get_trade(tid)
 
     def sell(self, user_id: str, code: str, shares: float, nav: float) -> tuple[Holding | None, Trade]:
@@ -275,17 +330,20 @@ class Storage:
             tid = self._add_trade(user_id, code, h.name, "sell", amount, shares, nav, realized)
         return self.get(user_id, code), self.get_trade(tid)
 
-    def apply_changes(self, user_id: str, changes) -> None:
-        """按截图对比结果写入交易记录，并把持仓同步成截图里的数字。"""
+    def apply_changes(self, user_id: str, changes) -> list[int]:
+        """按截图对比结果写入交易记录，并把持仓同步成截图里的数字。返回生成的买卖记录 ID（按顺序）。"""
+        ids = []
         with self.conn:
             for c in changes:
                 old = self.get(user_id, c.code)
                 expected = old.cost if old else 0.0
                 if c.kind in ("new", "buy"):
-                    self._add_trade(user_id, c.code, c.name, "buy", c.amount, c.shares, c.nav, 0.0)
+                    ids.append(self._add_trade(user_id, c.code, c.name, "buy", c.amount, c.shares, c.nav, 0.0))
                     expected += c.amount
                 elif c.kind == "sell":
-                    self._add_trade(user_id, c.code, c.name, "sell", c.amount, c.shares, c.nav, c.realized)
+                    ids.append(
+                        self._add_trade(user_id, c.code, c.name, "sell", c.amount, c.shares, c.nav, c.realized)
+                    )
                     expected -= c.amount - c.realized
                 if abs(c.new_cost - expected) > 0.01:  # 截图里的成本和推算的不一致，差额记为调整
                     self._add_trade(user_id, c.code, c.name, "adjust", c.new_cost - expected, 0.0, c.nav, 0.0)
@@ -293,11 +351,14 @@ class Storage:
                     _UPSERT_HOLDING,
                     (user_id, c.code, c.name, round(c.new_shares, 4), round(c.new_cost, 2), time.time()),
                 )
+        return ids
 
-    def _add_trade(self, user_id, code, name, kind, amount, shares, nav, realized) -> int:
+    def _add_trade(self, user_id, code, name, kind, amount, shares, nav, realized, ts=None, sip_id=None) -> int:
         cur = self.conn.execute(
-            "INSERT INTO trades (user_id, code, name, kind, amount, shares, nav, realized, ts) VALUES (?,?,?,?,?,?,?,?,?)",
-            (user_id, code, name, kind, round(amount, 2), round(shares, 4), nav, round(realized, 2), time.time()),
+            "INSERT INTO trades (user_id, code, name, kind, amount, shares, nav, realized, ts, sip_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (user_id, code, name, kind, round(amount, 2), round(shares, 4), nav, round(realized, 2),
+             ts if ts is not None else time.time(), sip_id),
         )
         return cur.lastrowid
 
@@ -406,6 +467,74 @@ class Storage:
                 "ON CONFLICT(user_id, code) DO UPDATE SET nav_date=excluded.nav_date",
                 [(user_id, c, d) for c, d in items.items()],
             )
+
+    # ------------------------------------------------------------ 决策日志
+    def add_note(self, user_id, code, name, kind, text, trade_id=None, amount=0.0, ts=None) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO notes (user_id, code, name, kind, text, trade_id, amount, ts) VALUES (?,?,?,?,?,?,?,?)",
+            (user_id, code, name, kind, text[:200], trade_id, amount, ts if ts is not None else time.time()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def notes(self, user_id: str, limit: int | None = None) -> list[Note]:
+        sql = ("SELECT id, user_id, code, name, kind, text, trade_id, amount, ts, reviewed FROM notes "
+               "WHERE user_id=? ORDER BY ts DESC")
+        args: list = [user_id]
+        if limit:
+            sql += " LIMIT ?"
+            args.append(limit)
+        return [Note.from_row(r) for r in self.conn.execute(sql, args).fetchall()]
+
+    def all_note_users(self) -> list[str]:
+        return [r[0] for r in self.conn.execute("SELECT DISTINCT user_id FROM notes").fetchall()]
+
+    def mark_reviewed(self, note_id: int, days: int) -> None:
+        row = self.conn.execute("SELECT reviewed FROM notes WHERE id=?", (note_id,)).fetchone()
+        if not row:
+            return
+        done = {x for x in row[0].split(",") if x}
+        done.add(str(days))
+        self.conn.execute("UPDATE notes SET reviewed=? WHERE id=?", (",".join(sorted(done, key=int)), note_id))
+        self.conn.commit()
+
+    # ------------------------------------------------------------ 定投计划
+    def add_sip(self, user_id, code, name, amount, rule, fee_rate=0.0, created=None) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO sip_plans (user_id, code, name, amount, rule, fee_rate, created) VALUES (?,?,?,?,?,?,?)",
+            (user_id, code, name, amount, rule, fee_rate, created if created is not None else time.time()),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def sips(self, user_id: str | None = None, active_only: bool = False) -> list[SipPlan]:
+        sql = "SELECT id, user_id, code, name, amount, rule, fee_rate, active, created, last_date FROM sip_plans"
+        cond, args = [], []
+        if user_id:
+            cond.append("user_id=?")
+            args.append(user_id)
+        if active_only:
+            cond.append("active=1")
+        if cond:
+            sql += " WHERE " + " AND ".join(cond)
+        return [SipPlan(*r) for r in self.conn.execute(sql + " ORDER BY id", args).fetchall()]
+
+    def update_sip(self, plan_id: int, **fields) -> None:
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self.conn.execute(f"UPDATE sip_plans SET {sets} WHERE id=?", (*fields.values(), plan_id))
+        self.conn.commit()
+
+    def del_sip(self, plan_id: int) -> None:
+        self.conn.execute("DELETE FROM sip_plans WHERE id=?", (plan_id,))
+        self.conn.commit()
+
+    def sip_trades(self, plan_id: int) -> list[Trade]:
+        rows = self.conn.execute(
+            "SELECT id, user_id, code, name, kind, amount, shares, nav, realized, ts FROM trades "
+            "WHERE sip_id=? ORDER BY ts",
+            (plan_id,),
+        ).fetchall()
+        return [Trade(*r) for r in rows]
 
     # ------------------------------------------------------------ 标签与目标
     def set_tag(self, user_id: str, code: str, tag: str | None) -> None:

@@ -148,5 +148,17 @@
     "type": "float",
     "default": 5.0,
     "hint": "某分组占比与目标相差超过该值时，在净值日报里提醒；之后每再偏 5 个百分点再提醒一次。0 表示不提醒。"
+  },
+  "review_days": {
+    "description": "复盘时间点（天）",
+    "type": "string",
+    "default": "30,90",
+    "hint": "记录理由后第几天推送复盘，多个用逗号分隔。"
+  },
+  "review_time": {
+    "description": "复盘推送时间",
+    "type": "string",
+    "default": "20:00",
+    "hint": "北京时间。只发给开启了每日推送的用户；没开推送可随时 /fund review 查看。"
   }
 }
