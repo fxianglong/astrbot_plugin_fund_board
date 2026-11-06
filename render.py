@@ -170,6 +170,8 @@ HELP = """📊 基金持仓看板 指令
 /fund overlap      重仓股穿透与基金重叠分析
 /fund check        组合体检（集中度、行业、回撤、经理）
 /fund board img    图片版看板（check img 同理）
+/fund weekly       本周周报（含 AI 点评）
 【其他】
 /fund info 代码    单只基金净值与阶段收益
-/fund help         显示本帮助"""
+/fund help         显示本帮助
+也可以直接问机器人：我哪只基金亏得最多？我的持仓集中吗？"""

@@ -57,5 +57,42 @@
     "type": "bool",
     "default": false,
     "hint": "开启后 /fund board、/fund check 和每日推送都以图片发送，渲染失败时自动改发文字。也可以在指令后加 img 或 text 临时切换，如 /fund board img。图片由 AstrBot 的文转图服务渲染。"
+  },
+  "weekly_report": {
+    "description": "开启每周周报",
+    "type": "bool",
+    "default": true,
+    "hint": "开启了每日推送的用户，每周在设定时间收到一份周报。"
+  },
+  "weekly_weekday": {
+    "description": "周报发送日（1=周一 … 7=周日）",
+    "type": "int",
+    "default": 6,
+    "hint": "默认周六，此时本周净值都已公布。"
+  },
+  "weekly_time": {
+    "description": "周报发送时间",
+    "type": "string",
+    "default": "10:00",
+    "hint": "北京时间，格式 HH:MM。"
+  },
+  "weekly_ai": {
+    "description": "周报附带 AI 点评",
+    "type": "bool",
+    "default": true,
+    "hint": "由大模型根据本周数据写一段中性点评，含操作建议字眼的句子会被自动过滤。"
+  },
+  "weekly_provider_id": {
+    "description": "周报点评使用的模型",
+    "type": "string",
+    "default": "",
+    "hint": "留空则使用推送会话当前的对话模型。",
+    "_special": "select_provider"
+  },
+  "enable_llm_tools": {
+    "description": "允许大模型查询持仓",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，和机器人正常聊天时可以直接问「我哪只基金亏得最多」之类的问题（需要模型支持函数调用）。群聊中只提供百分比。"
   }
 }

@@ -27,6 +27,9 @@ from .analysis import analyze
 from .render import DISCLAIMER, HELP, render_board, render_check, render_list, render_overlap, render_trades
 from .storage import Settings, Storage
 from .templates import BOARD_TMPL, CHECK_TMPL, board_data, check_data
+from .weekly import SYSTEM_PROMPT, build_week, llm_prompt, render_weekly, sanitize_commentary, week_info
+
+TOOL_NOTE = "（以上为用户在基金持仓看板插件中记录的数据。回答时只陈述数据，不要给出买入、卖出等操作建议。）"
 
 PLUGIN_NAME = "astrbot_plugin_fund_board"
 CONFIRM_WORDS = {"确认", "确认合并", "确认覆盖"}
@@ -38,7 +41,7 @@ PRIVACY_NOTE = "提示：截图会发送给当前配置的大模型服务商识�
 REPORT_TITLES = {"close": "🔔 收盘估值", "nav": "🌙 净值日报", "manual": "📊 持仓日报"}
 
 
-@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒与组合体检", "0.3.0")
+@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.4.0")
 class FundBoard(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -313,6 +316,147 @@ class FundBoard(Star):
         lines.append(DISCLAIMER)
         yield event.plain_result("\n".join(lines))
 
+    # ------------------------------------------------------------ 周报
+    async def _commentary(self, prompt: str, umo: str | None) -> str:
+        """让大模型写一段中性点评；没有可用模型或出错时返回空串。"""
+        if not self.config.get("weekly_ai", True):
+            return ""
+        try:
+            pid = (self.config.get("weekly_provider_id") or "").strip()
+            if not pid and umo:
+                pid = await self.context.get_current_chat_provider_id(umo)
+            if not pid:
+                return ""
+            resp = await asyncio.wait_for(
+                self.context.llm_generate(chat_provider_id=pid, prompt=prompt, system_prompt=SYSTEM_PROMPT),
+                timeout=60,
+            )
+            text = sanitize_commentary(resp.completion_text)
+            return text[:300]
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[fund_board] 周报点评生成失败: {e}")
+            return ""
+
+    async def _weekly_text(self, uid: str, show_amount: bool, umo: str | None, now: datetime) -> str:
+        res = await self._analyze(uid)
+        if not res:
+            return ""
+        summary, a = res
+        monday, _ = week_info(now)
+        codes = [r.code for r in summary.rows if r.market_value]
+        trends = {}
+        for c in codes:
+            try:
+                trends[c] = await self.ds.get_ac_trend(c)
+            except DataSourceError:
+                trends[c] = []
+        series = self.storage.index_series(uid, monday.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d"))
+        trades = self.storage.trades_since(uid, monday.timestamp())
+        report = build_week(summary, trends, series, trades, a.flags, now)
+        commentary = ""
+        if report.ret is not None:
+            commentary = await self._commentary(llm_prompt(report, show_amount), umo)
+        return render_weekly(report, show_amount, commentary)
+
+    @fund.command("weekly", alias={"周报"})
+    async def weekly(self, event: AstrMessageEvent):
+        """本周周报（含 AI 点评）"""
+        yield event.plain_result("正在生成本周周报，请稍候…")
+        try:
+            text = await self._weekly_text(
+                self._uid(event), self._show_amount(event), event.unified_msg_origin, datetime.now(CN_TZ)
+            )
+        except DataSourceError as e:
+            logger.error(f"[fund_board] 周报失败: {e}")
+            yield event.plain_result("获取数据失败，请稍后再试。")
+            return
+        yield event.plain_result(text or render_list([]))
+
+    # ------------------------------------------------------------ 自然语言查询（LLM 工具）
+    def _tools_on(self) -> bool:
+        return bool(self.config.get("enable_llm_tools", True))
+
+    @filter.llm_tool(name="fund_get_portfolio")
+    async def tool_portfolio(self, event: AstrMessageEvent, scope: str = "all"):
+        """查询当前用户在"基金持仓看板"插件里记录的基金持仓：每只基金的当日涨跌、市值、今日盈亏、累计盈亏和合计。用户问到自己的基金、持仓、收益、盈亏、哪只亏得最多等问题时调用。
+
+        Args:
+            scope(string): 填 all 返回全部持仓；填 6 位基金代码只返回这一只
+        """
+        if not self._tools_on():
+            return "管理员已关闭基金持仓查询工具。"
+        holdings = self.storage.list(self._uid(event))
+        if not holdings:
+            return "用户还没有在插件里记录基金持仓。可以告诉用户用 /fund add 或 /fund import 添加。"
+        code = (scope or "").strip()
+        if re.fullmatch(r"\d{6}", code):
+            holdings = [h for h in holdings if h.code == code]
+            if not holdings:
+                return f"用户的持仓里没有基金 {code}。"
+        try:
+            quotes = await self.ds.get_quotes([h.code for h in holdings])
+        except DataSourceError:
+            return "暂时取不到行情数据，请稍后再试。"
+        summary = build_summary(holdings, quotes)
+        show = self._show_amount(event)
+        text = render_board(summary, show)
+        if not show:
+            text += "\n（当前是群聊，只提供百分比，不要透露金额。）"
+        return text + "\n" + TOOL_NOTE
+
+    @filter.llm_tool(name="fund_lookup")
+    async def tool_lookup(self, event: AstrMessageEvent, code: str):
+        """查询任意一只公募基金的名称、类型、最新净值、盘中估值和近 1/3/6/12 个月收益。用户问某只基金（给出 6 位代码）的情况时调用。
+
+        Args:
+            code(string): 6 位基金代码
+        """
+        if not self._tools_on():
+            return "管理员已关闭基金查询工具。"
+        code = (code or "").strip()
+        if not re.fullmatch(r"\d{6}", code):
+            return "需要 6 位基金代码。"
+        q = await self._quote_one(code)
+        if not q:
+            return f"没查到基金 {code}。"
+        lines = [f"{q.name}（{code}）"]
+        try:
+            meta = await self.ds.get_meta(code)
+            if meta:
+                lines.append(f"类型：{meta.ftype}")
+        except DataSourceError:
+            pass
+        if q.nav is not None:
+            lines.append(f"最新净值 {q.nav}（{q.nav_date}，当日 {q.nav_pct if q.nav_pct is not None else '--'}%）")
+        if q.est is not None:
+            lines.append(f"盘中估值 {q.est}（{q.est_time}，{q.est_pct}%）")
+        try:
+            periods = await self.ds.get_period_returns(code)
+            lines.append("阶段收益：" + "，".join(f"{k} {v:+.2f}%" for k, v in periods.items() if v is not None))
+        except DataSourceError:
+            pass
+        return "\n".join(lines) + "\n" + TOOL_NOTE
+
+    @filter.llm_tool(name="fund_checkup")
+    async def tool_checkup(self, event: AstrMessageEvent, focus: str = "overview"):
+        """对当前用户记录的基金组合做体检：穿透重仓股后的个股和行业暴露、基金之间的持仓重叠、集中度、近一年回撤、经理任职。用户问持仓是否集中、基金是否重复、风险在哪里、买了哪些股票等问题时调用。
+
+        Args:
+            focus(string): overview 返回体检全貌；overlap 返回重仓股穿透和重叠细节
+        """
+        if not self._tools_on():
+            return "管理员已关闭基金体检工具。"
+        try:
+            res = await self._analyze(self._uid(event))
+        except DataSourceError:
+            return "暂时取不到数据，请稍后再试。"
+        if not res:
+            return "用户还没有在插件里记录基金持仓。"
+        summary, a = res
+        show = self._show_amount(event)
+        text = render_overlap(a, show) if (focus or "").strip() == "overlap" else render_check(a, summary, show)
+        return text + "\n" + TOOL_NOTE
+
     # ------------------------------------------------------------ 交易记录
     @fund.command("buy", alias={"买入", "加仓"})
     async def buy(self, event: AstrMessageEvent, code: str, amount: str, nav: str = ""):
@@ -531,8 +675,29 @@ class FundBoard(Star):
         except Exception as e:  # noqa: BLE001
             logger.error(f"[fund_board] 推送出错 {st.umo}: {e}")
 
+    async def _tick_weekly(self, now: datetime) -> None:
+        if not self.config.get("weekly_report", True):
+            return
+        wd = int(self.config.get("weekly_weekday", 6) or 6)
+        if now.isoweekday() != wd or now.strftime("%H:%M") < self._cfg_time("weekly_time", "10:00"):
+            return
+        _, key = week_info(now)
+        for st in self.storage.subscribers():
+            if st.last_weekly == key:
+                continue
+            try:
+                text = await self._weekly_text(st.user_id, st.private, st.umo, now)
+            except DataSourceError as e:
+                logger.error(f"[fund_board] 周报取数失败，稍后重试: {e}")
+                return
+            if text:
+                await self._send(st, text)
+            st.last_weekly = key
+            self.storage.save_settings(st)
+
     async def _tick(self, now: datetime) -> None:
-        if now.weekday() >= 5:  # 周末不推送；节假日由"今天有没有估值/净值"判断
+        await self._tick_weekly(now)
+        if now.weekday() >= 5:  # 周末不推送日报；节假日由"今天有没有估值/净值"判断
             return
         hm, today = now.strftime("%H:%M"), now.strftime("%Y-%m-%d")
         close_t, nav_t = self._cfg_time("close_push_time", "15:05"), self._cfg_time("nav_push_time", "21:30")
