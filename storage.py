@@ -31,6 +31,7 @@ class Settings:
     dd_alert: float | None = None  # 回撤提醒阈值 %
     last_close: str = ""  # 最近一次收盘推送日期
     last_nav: str = ""  # 最近一次净值日报日期
+    last_weekly: str = ""  # 最近一次周报对应的周（如 2026-W45）
 
 
 @dataclass
@@ -83,7 +84,14 @@ class Storage:
                 PRIMARY KEY (user_id, scope));
             """
         )
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """旧版本数据库补字段。"""
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(settings)").fetchall()}
+        if "last_weekly" not in cols:
+            self.conn.execute("ALTER TABLE settings ADD COLUMN last_weekly TEXT NOT NULL DEFAULT ''")
 
     # ------------------------------------------------------------ 持仓
     def upsert(self, user_id: str, code: str, name: str, shares: float, cost: float) -> None:
@@ -185,6 +193,14 @@ class Storage:
         args.append(limit)
         return [Trade(*r) for r in self.conn.execute(sql, args).fetchall()]
 
+    def trades_since(self, user_id: str, ts: float) -> list[Trade]:
+        rows = self.conn.execute(
+            "SELECT id, user_id, code, name, kind, amount, shares, nav, realized, ts FROM trades "
+            "WHERE user_id=? AND ts>=? ORDER BY ts",
+            (user_id, ts),
+        ).fetchall()
+        return [Trade(*r) for r in rows]
+
     def realized_total(self, user_id: str) -> float:
         row = self.conn.execute("SELECT COALESCE(SUM(realized), 0) FROM trades WHERE user_id=?", (user_id,)).fetchone()
         return float(row[0])
@@ -192,21 +208,23 @@ class Storage:
     # ------------------------------------------------------------ 设置
     def get_settings(self, user_id: str) -> Settings:
         row = self.conn.execute(
-            "SELECT user_id, umo, private, push_on, day_alert, dd_alert, last_close, last_nav FROM settings WHERE user_id=?",
+            "SELECT user_id, umo, private, push_on, day_alert, dd_alert, last_close, last_nav, last_weekly "
+            "FROM settings WHERE user_id=?",
             (user_id,),
         ).fetchone()
         if not row:
             return Settings(user_id)
-        return Settings(row[0], row[1], bool(row[2]), bool(row[3]), row[4], row[5], row[6], row[7])
+        return Settings(row[0], row[1], bool(row[2]), bool(row[3]), row[4], row[5], row[6], row[7], row[8])
 
     def save_settings(self, s: Settings) -> None:
         self.conn.execute(
-            """INSERT INTO settings (user_id, umo, private, push_on, day_alert, dd_alert, last_close, last_nav)
-               VALUES (?,?,?,?,?,?,?,?)
+            """INSERT INTO settings (user_id, umo, private, push_on, day_alert, dd_alert, last_close, last_nav, last_weekly)
+               VALUES (?,?,?,?,?,?,?,?,?)
                ON CONFLICT(user_id) DO UPDATE SET umo=excluded.umo, private=excluded.private,
                  push_on=excluded.push_on, day_alert=excluded.day_alert, dd_alert=excluded.dd_alert,
-                 last_close=excluded.last_close, last_nav=excluded.last_nav""",
-            (s.user_id, s.umo, int(s.private), int(s.push_on), s.day_alert, s.dd_alert, s.last_close, s.last_nav),
+                 last_close=excluded.last_close, last_nav=excluded.last_nav, last_weekly=excluded.last_weekly""",
+            (s.user_id, s.umo, int(s.private), int(s.push_on), s.day_alert, s.dd_alert, s.last_close, s.last_nav,
+             s.last_weekly),
         )
         self.conn.commit()
 
@@ -238,6 +256,16 @@ class Storage:
             return None
         peak = self.conn.execute("SELECT MAX(idx) FROM pindex WHERE user_id=?", (user_id,)).fetchone()[0]
         return row[0], max(peak, 1.0)
+
+    def index_series(self, user_id: str, start: str, end: str) -> list[tuple[str, float]]:
+        """[start, end] 区间内每天的组合指数，另外带上 start 之前最近的一天作为基准。"""
+        base = self.conn.execute(
+            "SELECT date, idx FROM pindex WHERE user_id=? AND date<? ORDER BY date DESC LIMIT 1", (user_id, start)
+        ).fetchall()
+        rows = self.conn.execute(
+            "SELECT date, idx FROM pindex WHERE user_id=? AND date>=? AND date<=? ORDER BY date", (user_id, start, end)
+        ).fetchall()
+        return [(d, i) for d, i in base + rows]
 
     def index_days(self, user_id: str) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM pindex WHERE user_id=?", (user_id,)).fetchone()[0]
