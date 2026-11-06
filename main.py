@@ -28,6 +28,18 @@ from .portfolio import CN_TZ, build_summary, drawdown_from_trend, has_trading_to
 from .analysis import analyze
 from .render import DISCLAIMER, HELP, render_board, render_check, render_list, render_overlap, render_trades
 from .storage import Holding, Settings, Storage
+from .journal import (
+    Rule,
+    due_reviews,
+    effective_trade_date,
+    parse_rule,
+    render_review,
+    render_sip_list,
+    render_sip_stats,
+    review_of,
+    scheduled_dates,
+    sip_stat,
+)
 from .perf import RANGE_ALIASES, RANGES, compute_perf, render_perf
 from .planning import (
     PRESETS,
@@ -71,7 +83,7 @@ PRIVACY_NOTE = "提示：截图会发送给当前配置的大模型服务商识�
 REPORT_TITLES = {"close": "🔔 收盘估值", "nav": "🌙 净值日报", "manual": "📊 持仓日报", "preclose": "⏰ 收盘前估值"}
 
 
-@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.6.0")
+@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.7.0")
 class FundBoard(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -90,6 +102,8 @@ class FundBoard(Star):
         self._intra_next: datetime | None = None
         self._intra_levels: dict[tuple[str, str, str], int] = {}
         self._last_gather: dict[str, tuple] = {}
+        self._sip_next: datetime | None = None
+        self._sip_done: dict[str, list[tuple[str, str]]] = {}
         self._task = asyncio.create_task(self._scheduler_loop())
 
     # ------------------------------------------------------------ 工具方法
@@ -107,6 +121,21 @@ class FundBoard(Star):
             return (await self.ds.get_quotes([code])).get(code)
         except DataSourceError:
             return None
+
+    @staticmethod
+    def _tail_after(event: AstrMessageEvent, code: str, skip: int) -> str:
+        """取消息里基金代码之后、跳过 skip 个参数的剩余文字（用于理由、笔记，允许包含空格）。"""
+        tokens = (event.message_str or "").split()
+        if code not in tokens:
+            return ""
+        i = tokens.index(code) + 1 + skip
+        return " ".join(tokens[i:]).strip()
+
+    def _split_nav_reason(self, event: AstrMessageEvent, code: str, nav: str) -> tuple[str, str]:
+        """buy/sell 的第三个参数可能是净值，也可能是理由的第一个词。"""
+        if nav and to_money(nav) is not None:
+            return nav, self._tail_after(event, code, 2)
+        return "", self._tail_after(event, code, 1)
 
     @staticmethod
     def _base(event: AstrMessageEvent) -> str:
@@ -706,6 +735,175 @@ class FundBoard(Star):
         results = [stress(sc, summary.rows, types, hs, ps) for sc in scenarios]
         yield event.plain_result(render_stress(results, self._show_amount(event)))
 
+    # ------------------------------------------------------------ 决策日志（v0.7）
+    def _review_windows(self) -> list[int]:
+        raw = str(self.config.get("review_days", "30,90") or "")
+        days = sorted({int(x) for x in re.findall(r"\d+", raw) if 0 < int(x) <= 3650})
+        return days or [30, 90]
+
+    async def _reviews(self, notes, now: datetime, days_of=lambda n: 0):
+        benches = await self._bench_trends()
+        out = []
+        for n in notes:
+            try:
+                trend = await self.ds.get_ac_trend(n.code)
+            except DataSourceError:
+                trend = []
+            out.append((n, review_of(n, days_of(n), trend, benches, now)))
+        return out
+
+    @fund.command("note", alias={"笔记", "记录"})
+    async def note(self, event: AstrMessageEvent, code: str = ""):
+        """记一笔想法：/fund note 代码 内容"""
+        code = code.strip()
+        text = self._tail_after(event, code, 0) if code else ""
+        if not re.fullmatch(r"\d{6}", code) or not text:
+            yield event.plain_result("用法：/fund note 016370 跌到 0.8 以下也不动。到期会推送复盘。")
+            return
+        q = await self._quote_one(code)
+        name = (q.name if q else "") or code
+        self.storage.add_note(self._base(event), code, name, "note", text)
+        days = "、".join(str(d) for d in self._review_windows())
+        yield event.plain_result(f"已记下关于 {name} 的想法。{days} 天后会推送复盘（需开启每日推送），也可以随时 /fund review 查看。")
+
+    @fund.command("review", alias={"复盘"})
+    async def review(self, event: AstrMessageEvent):
+        """查看决策日志和之后的表现"""
+        notes = self.storage.notes(self._base(event), limit=10)
+        if not notes:
+            yield event.plain_result("还没有决策日志。买卖时在指令末尾加一句理由，或用 /fund note 代码 内容 记录想法。")
+            return
+        now = datetime.now(CN_TZ)
+        reviews = await self._reviews(notes, now)
+        show = self._show_amount(event)
+        parts = ["🗒️ 决策日志（最近 10 条）"] + [render_review(r, show, n.amount) for n, r in reviews]
+        parts.append("只列出记录时的理由和之后的涨跌，不评价对错。")
+        yield event.plain_result("\n".join(parts))
+
+    async def _tick_review(self, now: datetime) -> None:
+        t = self._cfg_time("review_time", "20:00")
+        if now.strftime("%H:%M") < t:
+            return
+        today = now.strftime("%Y-%m-%d")
+        if self.storage.get_meta("review_date") == today:
+            return
+        windows = self._review_windows()
+        for st in self.storage.subscribers():
+            due = due_reviews(self.storage.notes(st.user_id), now, windows)
+            if not due:
+                continue
+            days_of = {n.id: d for n, d in due}
+            reviews = await self._reviews([n for n, _ in due], now, lambda n: days_of[n.id])
+            show = st.private or bool(self.config.get("group_show_amount", False))
+            text = "\n".join(
+                ["🗒️ 到期复盘"] + [render_review(r, show, n.amount) for n, r in reviews]
+                + ["只列出记录时的理由和之后的涨跌，不评价对错。"]
+            )
+            await self._send(st, text)
+            for n, d in due:
+                self.storage.mark_reviewed(n.id, d)
+        self.storage.set_meta("review_date", today)
+
+    # ------------------------------------------------------------ 定投（v0.7）
+    @fund.command("sip", alias={"定投"})
+    async def sip(self, event: AstrMessageEvent, action: str = "", a1: str = "", a2: str = "", a3: str = "", a4: str = ""):
+        """定投计划：/fund sip add 代码 金额 规则 [费率] ｜ list ｜ pause/resume/del N ｜ stats"""
+        uid = self._uid(event)
+        act = action.strip().lower()
+        if act in ("add", "新增", "添加"):
+            code, amt, rule, fee = a1.strip(), to_money(a2), parse_rule(a3), to_money((a4 or "0").rstrip("%"))
+            if not re.fullmatch(r"\d{6}", code) or not amt or amt <= 0 or not rule or fee is None or not 0 <= fee < 5:
+                yield event.plain_result(
+                    "用法：/fund sip add 代码 金额 规则 [费率%]\n"
+                    "规则：每周三、每两周周一、每月15日、每个交易日\n例如：/fund sip add 110020 500 每周三 0.12"
+                )
+                return
+            q = await self._quote_one(code)
+            if not q:
+                yield event.plain_result(f"没查到基金 {code}。")
+                return
+            pid = self.storage.add_sip(uid, code, q.name or code, amt, rule.dump(), fee)
+            yield event.plain_result(
+                f"已创建定投计划 {pid}：{q.name}（{code}）{rule.text()} {amt:,.0f} 元。\n"
+                "扣款日遇到非交易日顺延，当天净值公布后自动记一笔买入；只是插件里的记录，不会真实扣款。"
+            )
+            return
+        if act in ("pause", "暂停", "resume", "恢复", "del", "删除"):
+            pid = int(a1) if a1.strip().isdigit() else -1
+            plan = next((p for p in self.storage.sips(uid) if p.id == pid), None)
+            if not plan:
+                yield event.plain_result("没有这个计划编号，发送 /fund sip list 查看。")
+                return
+            if act in ("del", "删除"):
+                self.storage.del_sip(pid)
+                yield event.plain_result(f"已删除定投计划 {pid}，已经记账的买入记录保留。")
+            else:
+                active = act in ("resume", "恢复")
+                fields = {"active": int(active)}
+                if active:  # 恢复时从今天起算，暂停期间不补记
+                    fields["last_date"] = (datetime.now(CN_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+                self.storage.update_sip(pid, **fields)
+                yield event.plain_result(f"已{'恢复' if active else '暂停'}定投计划 {pid}。")
+            return
+        if act in ("stats", "统计"):
+            plans = self.storage.sips(uid)
+            codes = list({p.code for p in plans})
+            try:
+                quotes = await self.ds.get_quotes(codes) if codes else {}
+            except DataSourceError:
+                quotes = {}
+            now = datetime.now(CN_TZ)
+            stats = [
+                sip_stat(p, self.storage.sip_trades(p.id), quotes[p.code].nav if p.code in quotes else None, now)
+                for p in plans
+            ]
+            yield event.plain_result(render_sip_stats(stats, self._show_amount(event)))
+            return
+        yield event.plain_result(render_sip_list(self.storage.sips(uid)))
+
+    async def _tick_sip(self, now: datetime) -> None:
+        """按计划补记定投：每个扣款日取「当天或之后第一个交易日」的单位净值记一笔买入。"""
+        if self._sip_next and now < self._sip_next:
+            return
+        self._sip_next = now + timedelta(minutes=10)
+        today = now.date()
+        plans = self.storage.sips(active_only=True)
+        if not plans:
+            return
+        try:
+            quotes = await self.ds.get_quotes(list({p.code for p in plans}))
+        except DataSourceError:
+            return
+        for p in plans:
+            rule = Rule.load(p.rule)
+            created = datetime.fromtimestamp(p.created, CN_TZ)
+            if p.last_date:
+                start = datetime.strptime(p.last_date, "%Y-%m-%d").date() + timedelta(days=1)
+            else:  # 15:00 之后创建的，当天的扣款赶不上，从第二天算
+                start = created.date() + timedelta(days=1 if created.hour >= 15 else 0)
+            dates = scheduled_dates(rule, start, today, created.date())
+            if not dates:
+                continue
+            try:
+                trend = await self.ds.get_unit_trend(p.code)
+            except DataSourceError:
+                trend = []
+            q = quotes.get(p.code)
+            for d in dates:
+                eff = effective_trade_date(trend, d)
+                if eff is None and q and q.nav and q.nav_date == today.strftime("%Y-%m-%d") and d <= today:
+                    eff = (today, q.nav)
+                if eff is None:
+                    break  # 净值还没出，下次再试
+                eff_date, nav = eff
+                ts = datetime(eff_date.year, eff_date.month, eff_date.day, 15, 0, tzinfo=CN_TZ).timestamp()
+                self.storage.buy(p.user_id, p.code, p.name, p.amount, nav, fee_rate=p.fee_rate, ts=ts, sip_id=p.id)
+                self.storage.update_sip(p.id, last_date=d.strftime("%Y-%m-%d"))
+                base = p.user_id.split("#", 1)[0]
+                self._sip_done.setdefault(base, []).append(
+                    (today.strftime("%Y-%m-%d"), f"📆 定投已记账：{p.name} {p.amount:,.0f} 元（{eff_date:%m-%d} 净值 {nav}）")
+                )
+
     # ------------------------------------------------------------ 周报
     async def _commentary(self, prompt: str, umo: str | None) -> str:
         """让大模型写一段中性点评；没有可用模型或出错时返回空串。"""
@@ -748,7 +946,15 @@ class FundBoard(Star):
         commentary = ""
         if report.ret is not None:
             commentary = await self._commentary(llm_prompt(report, show_amount), umo)
-        return render_weekly(report, show_amount, commentary)
+        text = render_weekly(report, show_amount, commentary)
+        due = [
+            (n, w) for n in self.storage.notes(uid) for w in self._review_windows()
+            if monday.timestamp() <= n.ts + w * 86400 <= now.timestamp()
+        ]
+        if due:
+            names = "、".join(dict.fromkeys(n.name for n, _ in due))
+            text += f"\n🗒️ 本周到期复盘 {len(due)} 条（{names}），发送 /fund review 查看。"
+        return text
 
     @fund.command("weekly", alias={"周报"})
     async def weekly(self, event: AstrMessageEvent):
@@ -870,8 +1076,9 @@ class FundBoard(Star):
     # ------------------------------------------------------------ 交易记录
     @fund.command("buy", alias={"买入", "加仓"})
     async def buy(self, event: AstrMessageEvent, code: str, amount: str, nav: str = ""):
-        """记录加仓：/fund buy 代码 金额 [净值]"""
+        """记录加仓：/fund buy 代码 金额 [净值] [理由]"""
         code = code.strip()
+        nav, reason = self._split_nav_reason(event, code, nav)
         amt = to_money(amount)
         if not re.fullmatch(r"\d{6}", code) or amt is None or amt <= 0:
             yield event.plain_result("格式：/fund buy 代码 金额 [净值]，例如 /fund buy 016370 1000")
@@ -883,7 +1090,9 @@ class FundBoard(Star):
             return
         name = (q.name if q else "") or code
         h, t = self.storage.buy(self._uid(event), code, name, amt, price)
-        msg = f"已记录买入 {name}（{code}）"
+        if reason:
+            self.storage.add_note(self._base(event), code, name, "buy", reason, t.id, amt)
+        msg = f"已记录买入 {name}（{code}）" + ("，理由已记下" if reason else "")
         if self._show_amount(event):
             msg += (
                 f"\n金额 {amt:,.2f} ｜ 按净值 {price} 计 {t.shares:,.2f} 份"
@@ -891,12 +1100,15 @@ class FundBoard(Star):
             )
         if not nav:
             msg += "\n（按最新净值估算份额，实际以基金公司确认为准；确认后可用 /fund add 校准）"
+        if not reason:
+            msg += "\n可以在指令末尾加一句理由，30 天和 90 天后会推送复盘。"
         yield event.plain_result(msg)
 
     @fund.command("sell", alias={"卖出", "赎回"})
     async def sell(self, event: AstrMessageEvent, code: str, shares: str, nav: str = ""):
-        """记录赎回：/fund sell 代码 份额|全部 [净值]"""
+        """记录赎回：/fund sell 代码 份额|全部 [净值] [理由]"""
         code = code.strip()
+        nav, reason = self._split_nav_reason(event, code, nav)
         uid = self._uid(event)
         h = self.storage.get(uid, code)
         if not h:
@@ -916,7 +1128,9 @@ class FundBoard(Star):
         except ValueError as e:
             yield event.plain_result(str(e))
             return
-        msg = f"已记录卖出 {h.name}（{code}）"
+        if reason:
+            self.storage.add_note(self._base(event), code, h.name, "sell", reason, t.id, t.amount)
+        msg = f"已记录卖出 {h.name}（{code}）" + ("，理由已记下" if reason else "")
         if self._show_amount(event):
             msg += f"\n{t.shares:,.2f} 份 × 净值 {price} = {t.amount:,.2f} ｜ 实现盈亏 {t.realized:+,.2f}"
             msg += f"\n剩余 {left.shares:,.2f} 份 ｜ 成本 {left.cost:,.2f}" if left else "\n已全部卖出，持仓已移除"
@@ -1063,6 +1277,10 @@ class FundBoard(Star):
                 self.storage, uid, summary, day_th, dd_th, portfolio, fund_dds, dry=(mode == "manual")
             )
             extra.extend(alert_lines)
+            if mode == "nav":
+                today_s = now.strftime("%Y-%m-%d")
+                extra.extend(t for d, t in self._sip_done.get(uid, []) if d == today_s)
+                self._sip_done.pop(uid, None)
             if self.storage.targets(uid) and self._tolerance() > 0:
                 dry = mode == "manual"
                 drift = drift_lines(
@@ -1165,6 +1383,8 @@ class FundBoard(Star):
             self.storage.set_reported(st.user_id, {h.code: q.nav_date for h, q in fresh})
 
     async def _tick(self, now: datetime) -> None:
+        await self._tick_sip(now)
+        await self._tick_review(now)
         await self._tick_weekly(now)
         await self._tick_qdii(now)
         await self._tick_snapshot(now)
@@ -1260,6 +1480,24 @@ class FundBoard(Star):
                 controller.stop()
                 return
 
+            # ---- 阶段三：给截图生成的交易补理由
+            if state["stage"] == "reason":
+                m = re.fullmatch(r"理由\s*(\d+)\s+(.+)", text, re.S)
+                if not m:
+                    await ev.send(ev.plain_result("好的，已结束。"))
+                    controller.stop()
+                    return
+                k = int(m.group(1))
+                if not 1 <= k <= len(state["reasons"]):
+                    await ev.send(ev.plain_result("编号不对，请看上面的列表。"))
+                    return
+                c, tid = state["reasons"][k - 1]
+                kind = "sell" if c.kind == "sell" else "buy"
+                self.storage.add_note(self._base(ev), c.code, c.name, kind, m.group(2).strip(), tid, c.amount)
+                await ev.send(ev.plain_result(f"已记下第 {k} 笔的理由。可以继续，或回复其他内容结束。"))
+                controller.keep(timeout=300, reset_timeout=True)
+                return
+
             # ---- 阶段一：收图
             if state["stage"] == "collect":
                 new_imgs = await self._collect_images(ev)
@@ -1317,8 +1555,19 @@ class FundBoard(Star):
                 if text == "确认更新" and existing:
                     navs = {c: q.nav for c, q in quotes.items() if q.nav}
                     changes, missing = diff_holdings(existing, rows, navs)
-                    self.storage.apply_changes(uid, changes)
-                    await ev.send(ev.plain_result(render_changes(changes, missing, show_amount)))
+                    ids = self.storage.apply_changes(uid, changes)
+                    moved = [c for c in changes if c.kind != "same"]
+                    text_out = render_changes(changes, missing, show_amount)
+                    if ids:
+                        state.update(stage="reason", reasons=list(zip(moved, ids)))
+                        kinds = {"new": "新买入", "buy": "加仓", "sell": "减仓"}
+                        text_out += "\n\n要给这些交易记一句理由吗？30 天和 90 天后会推送复盘。\n" + "\n".join(
+                            f"{i}. {kinds[c.kind]} {c.name}" for i, (c, _) in enumerate(state["reasons"], 1)
+                        ) + "\n回复「理由 1 内容」，回复其他内容结束。"
+                        await ev.send(ev.plain_result(text_out))
+                        controller.keep(timeout=300, reset_timeout=True)
+                        return
+                    await ev.send(ev.plain_result(text_out))
                     controller.stop()
                     return
                 replace_all = text == "确认覆盖"

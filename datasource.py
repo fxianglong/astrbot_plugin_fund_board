@@ -285,6 +285,21 @@ class FundDataSource:
     async def get_ac_trend(self, code: str) -> list[tuple[int, float]]:
         return self.parse_ac_trend(await self._get_pingzhong(code))
 
+    @staticmethod
+    def parse_unit_trend(text: str) -> list[tuple[int, float]]:
+        """单位净值走势 [(毫秒时间戳, 单位净值)]，定投按扣款日的单位净值记账。"""
+        rows = extract_js_var(text, "Data_netWorthTrend") or []
+        out = []
+        for r in rows:
+            if isinstance(r, dict) and r.get("x") is not None:
+                v = _num(r.get("y"))
+                if v is not None:
+                    out.append((int(r["x"]), v))
+        return out
+
+    async def get_unit_trend(self, code: str) -> list[tuple[int, float]]:
+        return self.parse_unit_trend(await self._get_pingzhong(code))
+
     # ------------------------------------------------------------ 体检资料
     @staticmethod
     def parse_profile(text: str) -> FundProfile:
