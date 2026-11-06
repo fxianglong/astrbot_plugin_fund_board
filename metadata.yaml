@@ -1,0 +1,7 @@
+name: astrbot_plugin_fund_board
+display_name: 基金持仓看板
+desc: 记录基金持仓，查看盘中估值与盈亏，支持截图一键导入持仓。
+short_desc: 基金持仓看板，截图一键导入
+version: v0.1.0
+author: fxianglong
+repo: https://github.com/fxianglong/astrbot_plugin_fund_board
