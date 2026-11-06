@@ -188,6 +188,11 @@ HELP = """📊 基金持仓看板 指令
 /fund review          决策日志和之后的表现
 /fund sip add 代码 金额 规则 [费率]  定投计划，如 /fund sip add 110020 500 每周三
 /fund sip list ｜ stats ｜ pause N ｜ resume N ｜ del N
+【账户与工具】
+/fund account [add|use|del 名称]  多账户，/fund board all 看合并
+/fund fee           费用透视（管理费、托管费、销售服务费，A/C 类对比）
+/fund watch [add 代码 [提醒%]|del 代码|check 代码]  自选关注
+/fund export        导出备份（私聊）  /fund restore 从备份恢复
 【其他】
 /fund info 代码    单只基金净值与阶段收益
 /fund help         显示本帮助
