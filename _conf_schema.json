@@ -1,0 +1,25 @@
+{
+  "vision_provider_id": {
+    "description": "截图识别使用的模型",
+    "type": "string",
+    "default": "",
+    "hint": "需要支持图片输入的模型（如 GPT-4o、Qwen-VL、GLM-4V 等）。留空则使用当前会话的对话模型。",
+    "_special": "select_provider"
+  },
+  "group_show_amount": {
+    "description": "群聊中显示金额",
+    "type": "bool",
+    "default": false,
+    "hint": "关闭时，群聊里的看板只显示涨跌百分比，私聊显示完整金额。"
+  },
+  "max_images": {
+    "description": "单次导入最多截图数",
+    "type": "int",
+    "default": 6
+  },
+  "request_timeout": {
+    "description": "行情接口超时（秒）",
+    "type": "int",
+    "default": 10
+  }
+}
