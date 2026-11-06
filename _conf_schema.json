@@ -106,5 +106,41 @@
     "type": "int",
     "default": 60,
     "hint": "每天 08:00～23:30 按此间隔检查，最小 10 分钟。"
+  },
+  "benchmarks": {
+    "description": "收益对比基准",
+    "type": "string",
+    "default": "沪深300:110020,纳指100:270042",
+    "hint": "格式 名称:基金代码，多个用逗号分隔。用指数联接基金的累计净值近似指数表现。"
+  },
+  "snapshot_time": {
+    "description": "每日快照时间",
+    "type": "string",
+    "default": "23:40",
+    "hint": "交易日在此时间给所有有持仓的用户记录市值和组合指数，用于收益计算，与是否开启推送无关。"
+  },
+  "intraday_alert": {
+    "description": "盘中估值提醒",
+    "type": "bool",
+    "default": true,
+    "hint": "交易日 09:45～14:57 定时检查估值，组合跌幅超过单日提醒线、或单只基金跌幅超过下面的阈值时提醒，之后每再跌 2 个百分点再提醒一次。只发给开启了每日推送的用户。"
+  },
+  "intraday_minutes": {
+    "description": "盘中检查间隔（分钟）",
+    "type": "int",
+    "default": 15,
+    "hint": "最小 5 分钟。"
+  },
+  "intraday_fund_alert": {
+    "description": "盘中单只基金跌幅提醒（%）",
+    "type": "float",
+    "default": 5.0,
+    "hint": "0 表示不提醒单只基金。"
+  },
+  "preclose_push_time": {
+    "description": "收盘前估值推送时间",
+    "type": "string",
+    "default": "14:45",
+    "hint": "在 15:00 申赎截止前推送一份估值看板，方便当天决定是否操作。留空则不推送。"
   }
 }

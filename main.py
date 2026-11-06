@@ -27,9 +27,18 @@ from . import alerts
 from .portfolio import CN_TZ, build_summary, drawdown_from_trend, has_trading_today, nav_readiness
 from .analysis import analyze
 from .render import DISCLAIMER, HELP, render_board, render_check, render_list, render_overlap, render_trades
-from .storage import Settings, Storage
-from .templates import BOARD_TMPL, CHECK_TMPL, board_data, check_data
-from .weekly import SYSTEM_PROMPT, build_week, llm_prompt, render_weekly, sanitize_commentary, week_info
+from .storage import Holding, Settings, Storage
+from .perf import RANGE_ALIASES, RANGES, compute_perf, render_perf
+from .templates import BOARD_TMPL, CHECK_TMPL, PERF_TMPL, board_data, check_data, perf_data
+from .weekly import (
+    SYSTEM_PROMPT,
+    build_week,
+    fund_week_return,
+    llm_prompt,
+    render_weekly,
+    sanitize_commentary,
+    week_info,
+)
 
 TOOL_NOTE = "（以上为用户在基金持仓看板插件中记录的数据。回答时只陈述数据，不要给出买入、卖出等操作建议。）"
 
@@ -40,10 +49,10 @@ CANCEL_WORDS = {"取消", "退出", "算了"}
 PRIVACY_NOTE = "提示：截图会发送给当前配置的大模型服务商识别，请确认你接受。识别结果只保存在本机 AstrBot 的数据库里。"
 
 
-REPORT_TITLES = {"close": "🔔 收盘估值", "nav": "🌙 净值日报", "manual": "📊 持仓日报"}
+REPORT_TITLES = {"close": "🔔 收盘估值", "nav": "🌙 净值日报", "manual": "📊 持仓日报", "preclose": "⏰ 收盘前估值"}
 
 
-@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.4.1")
+@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.5.0")
 class FundBoard(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -59,6 +68,8 @@ class FundBoard(Star):
         self._matcher: FundMatcher | None = None
         self._nav_next_try: datetime | None = None
         self._qdii_next: datetime | None = None
+        self._intra_next: datetime | None = None
+        self._intra_levels: dict[tuple[str, str, str], int] = {}
         self._task = asyncio.create_task(self._scheduler_loop())
 
     # ------------------------------------------------------------ 工具方法
@@ -78,8 +89,41 @@ class FundBoard(Star):
             return None
 
     @staticmethod
-    def _uid(event: AstrMessageEvent) -> str:
+    def _base(event: AstrMessageEvent) -> str:
+        """用户本人（不区分账户），推送设置、提醒、分析都按这个 ID。"""
         return f"{event.get_platform_id()}:{event.get_sender_id()}"
+
+    def _uid(self, event: AstrMessageEvent) -> str:
+        """当前账户的存储 ID，持仓和交易按这个 ID 存。"""
+        return self._account_uid(self._base(event))
+
+    def _account_uid(self, base: str) -> str:
+        return base  # v0.8 多账户时改为当前选中的账户
+
+    def _account_uids(self, base: str) -> list[str]:
+        return [base]  # v0.8 多账户时返回该用户的全部账户
+
+    def _merged_holdings(self, base: str):
+        """该用户全部账户的持仓，同一基金合并份额和成本。"""
+        merged: dict[str, Holding] = {}
+        for u in self._account_uids(base):
+            for h in self.storage.list(u):
+                if h.code in merged:
+                    m = merged[h.code]
+                    merged[h.code] = Holding(base, h.code, m.name, m.shares + h.shares, m.cost + h.cost,
+                                             max(m.updated_at, h.updated_at))
+                else:
+                    merged[h.code] = Holding(base, h.code, h.name, h.shares, h.cost, h.updated_at)
+        return sorted(merged.values(), key=lambda h: -h.cost)
+
+    def _merged_trades(self, base: str, since: float = 0.0):
+        out = []
+        for u in self._account_uids(base):
+            out.extend(self.storage.trades_since(u, since))
+        return sorted(out, key=lambda t: (t.ts, t.id))
+
+    def _merged_realized(self, base: str) -> float:
+        return sum(self.storage.realized_total(u) for u in self._account_uids(base))
 
     def _show_amount(self, event: AstrMessageEvent) -> bool:
         return event.is_private_chat() or bool(self.config.get("group_show_amount", False))
@@ -158,8 +202,8 @@ class FundBoard(Star):
             return None
 
     async def _analyze(self, uid: str):
-        """取重仓股、经理、走势等数据并做穿透分析。返回 (summary, analysis)，没有持仓时返回 None。"""
-        holdings = self.storage.list(uid)
+        """取重仓股、经理、走势等数据并做穿透分析（合并全部账户）。返回 (summary, analysis)，没有持仓时返回 None。"""
+        holdings = self._merged_holdings(uid)
         if not holdings:
             return None
         codes = [h.code for h in holdings]
@@ -199,7 +243,7 @@ class FundBoard(Star):
         """重仓股穿透与基金重叠分析"""
         yield event.plain_result("正在获取各基金重仓股，请稍候…")
         try:
-            res = await self._analyze(self._uid(event))
+            res = await self._analyze(self._base(event))
         except DataSourceError as e:
             logger.error(f"[fund_board] 分析失败: {e}")
             yield event.plain_result("获取数据失败，请稍后再试。")
@@ -214,7 +258,7 @@ class FundBoard(Star):
         """组合体检：/fund check [img|text]"""
         yield event.plain_result("正在体检，需要获取每只基金的重仓股和历史走势，请稍候…")
         try:
-            res = await self._analyze(self._uid(event))
+            res = await self._analyze(self._base(event))
         except DataSourceError as e:
             logger.error(f"[fund_board] 体检失败: {e}")
             yield event.plain_result("获取数据失败，请稍后再试。")
@@ -229,7 +273,20 @@ class FundBoard(Star):
             if path:
                 yield event.image_result(path)
                 return
-        yield event.plain_result(render_check(a, summary, show))
+        text = render_check(a, summary, show)
+        try:
+            p = await self._perf(self._base(event), "全部", datetime.now(CN_TZ))
+        except DataSourceError:
+            p = None
+        if p and (p.twr is not None or p.xirr is not None):
+            parts = []
+            if p.twr is not None:
+                parts.append(f"记录以来组合 {p.twr:+.2f}%")
+            if p.xirr is not None:
+                parts.append(f"年化 {p.xirr:+.2f}%")
+            parts += [f"{b.name} {b.ret:+.2f}%" for b in p.benches if b.ret is not None]
+            text += "\n收益：" + "｜".join(parts) + "（详见 /fund perf）"
+        yield event.plain_result(text)
 
     @fund.command("list", alias={"持仓"})
     async def list_(self, event: AstrMessageEvent):
@@ -258,7 +315,7 @@ class FundBoard(Star):
         shares = amt / q.nav
         cost = amt - prf
         existed = any(h.code == code for h in self.storage.list(self._uid(event)))
-        self.storage.upsert(self._uid(event), code, q.name, shares, cost)
+        self.storage.upsert(self._uid(event), code, q.name, shares, cost, nav=q.nav)
         verb = "已更新" if existed else "已添加"
         if self._show_amount(event):
             msg = (
@@ -272,7 +329,8 @@ class FundBoard(Star):
     @fund.command("del", alias={"删除"})
     async def delete(self, event: AstrMessageEvent, code: str):
         """删除一只基金"""
-        ok = self.storage.delete(self._uid(event), code.strip())
+        q = await self._quote_one(code.strip())
+        ok = self.storage.delete(self._uid(event), code.strip(), nav=q.nav if q else None)
         yield event.plain_result(f"已删除 {code}" if ok else f"持仓里没有 {code}")
 
     @fund.command("clear", alias={"清空"})
@@ -281,7 +339,12 @@ class FundBoard(Star):
         if confirm != "确认":
             yield event.plain_result("将清空你的全部持仓，确定的话请发送：/fund clear 确认")
             return
-        n = self.storage.clear(self._uid(event))
+        uid = self._uid(event)
+        try:
+            quotes = await self.ds.get_quotes([h.code for h in self.storage.list(uid)])
+        except DataSourceError:
+            quotes = {}
+        n = self.storage.clear(uid, navs={c: q.nav for c, q in quotes.items() if q.nav})
         yield event.plain_result(f"已清空 {n} 只基金。")
 
     @fund.command("info", alias={"查询"})
@@ -319,6 +382,174 @@ class FundBoard(Star):
         lines.append(DISCLAIMER)
         yield event.plain_result("\n".join(lines))
 
+    # ------------------------------------------------------------ 收益表现（v0.5）
+    def _benchmarks(self) -> dict[str, str]:
+        """配置里的基准：'沪深300:110020,纳指100:270042' -> {名称: 代码}。"""
+        raw = str(self.config.get("benchmarks", "沪深300:110020,纳指100:270042") or "")
+        out = {}
+        for part in re.split(r"[,，;；\s]+", raw):
+            if ":" in part or "：" in part:
+                name, code = re.split(r"[:：]", part, maxsplit=1)
+                if re.fullmatch(r"\d{6}", code.strip()) and name.strip():
+                    out[name.strip()] = code.strip()
+        return out
+
+    async def _bench_trends(self) -> dict[str, tuple[str, list[tuple[int, float]]]]:
+        out = {}
+        for name, code in self._benchmarks().items():
+            try:
+                out[name] = (code, await self.ds.get_ac_trend(code))
+            except DataSourceError as e:
+                logger.warning(f"[fund_board] 基准 {name}({code}) 获取失败: {e}")
+                out[name] = (code, [])
+        return out
+
+    async def _perf(self, base: str, range_name: str, now: datetime):
+        holdings = self._merged_holdings(base)
+        if not holdings:
+            return None
+        quotes = await self.ds.get_quotes([h.code for h in holdings])
+        summary = build_summary(holdings, quotes, now)
+        return compute_perf(
+            range_name,
+            now,
+            self._merged_trades(base),
+            summary.market_value,
+            self.storage.index_all(base),
+            self.storage.snapshots(base),
+            await self._bench_trends(),
+        )
+
+    @staticmethod
+    def _parse_range(text: str) -> str | None:
+        t = (text or "").strip().lower()
+        if not t:
+            return "全部"
+        if t in RANGES:
+            return t
+        return RANGE_ALIASES.get(t)
+
+    @fund.command("perf", alias={"收益", "表现"})
+    async def perf(self, event: AstrMessageEvent, range_: str = "", mode: str = ""):
+        """收益表现与基准对比：/fund perf [近1月|近3月|近6月|近1年|今年|全部] [img]"""
+        if range_.strip().lower() in ("img", "image", "图", "图片", "text", "文字"):
+            range_, mode = "", range_
+        rn = self._parse_range(range_)
+        if not rn:
+            yield event.plain_result("区间可选：近1月、近3月、近6月、近1年、今年、全部")
+            return
+        try:
+            p = await self._perf(self._base(event), rn, datetime.now(CN_TZ))
+        except DataSourceError as e:
+            logger.error(f"[fund_board] 收益计算失败: {e}")
+            yield event.plain_result("获取数据失败，请稍后再试。")
+            return
+        if not p:
+            yield event.plain_result(render_list([]))
+            return
+        show = self._show_amount(event)
+        if self._want_image(mode):
+            path = await self._render_img(PERF_TMPL, perf_data(p, show), event.unified_msg_origin)
+            if path:
+                yield event.image_result(path)
+                return
+        yield event.plain_result(render_perf(p, show))
+
+    async def _tick_snapshot(self, now: datetime) -> None:
+        """每个交易日晚上给所有有持仓的用户记一次市值快照和组合指数（不依赖是否开启推送）。"""
+        if now.weekday() >= 5 or now.strftime("%H:%M") < self._cfg_time("snapshot_time", "23:40"):
+            return
+        today = now.strftime("%Y-%m-%d")
+        if self.storage.get_meta("snapshot_date") == today:
+            return
+        bases = sorted({u.split("#", 1)[0] for u in self.storage.all_user_ids()})
+        for base in bases:
+            holdings = self._merged_holdings(base)
+            if not holdings:
+                continue
+            try:
+                quotes = await self.ds.get_quotes([h.code for h in holdings])
+            except DataSourceError as e:
+                logger.warning(f"[fund_board] 快照取行情失败，稍后重试: {e}")
+                return
+            if not any(q.nav_date == today for q in quotes.values()):
+                continue  # 今天不是交易日，或净值都没出
+            summary = build_summary(holdings, quotes, now)
+            self.storage.record_snapshot(base, today, summary.market_value, summary.cost)
+            if summary.day_pct is not None:
+                self.storage.record_index(base, today, summary.day_pct)
+        self.storage.set_meta("snapshot_date", today)
+
+    # ------------------------------------------------------------ 盘中估值监控（v0.5）
+    def _intraday_level(self, value: float, threshold: float) -> int:
+        if threshold <= 0 or value < threshold:
+            return 0
+        return 1 + int((value - threshold) // 2)  # 每再跌 2 个百分点再提醒一次
+
+    async def _tick_intraday(self, now: datetime) -> None:
+        if not self.config.get("intraday_alert", True) or now.weekday() >= 5:
+            return
+        hm, today = now.strftime("%H:%M"), now.strftime("%Y-%m-%d")
+        if not ("09:45" <= hm <= "14:57"):
+            return
+        if self._intra_next and now < self._intra_next:
+            return
+        self._intra_next = now + timedelta(minutes=max(int(self.config.get("intraday_minutes", 15) or 15), 5))
+        fund_th = float(self.config.get("intraday_fund_alert", 5) or 0)
+        for st in self.storage.subscribers():
+            holdings = self._merged_holdings(st.user_id)
+            if not holdings:
+                continue
+            try:
+                quotes = await self.ds.get_quotes([h.code for h in holdings])
+            except DataSourceError:
+                return
+            if not any(q.est_time and q.est_time[:10] == today for q in quotes.values()):
+                continue
+            summary = build_summary(holdings, quotes, now)
+            day_th, _ = self._thresholds(st)
+            show = st.private or bool(self.config.get("group_show_amount", False))
+            lines = []
+
+            def hit(scope: str, drop: float, th: float) -> bool:
+                key = (st.user_id, today, scope)
+                lvl = self._intraday_level(drop, th)
+                if lvl > self._intra_levels.get(key, 0):
+                    self._intra_levels[key] = lvl
+                    return True
+                return False
+
+            if summary.day_pct is not None and hit("portfolio", -summary.day_pct, day_th):
+                amt = f"（约 {summary.day_profit:+,.0f} 元）" if show else ""
+                lines.append(f"组合估算 {summary.day_pct:+.2f}%{amt}，超过 {day_th:g}% 提醒线")
+            for r in summary.rows:
+                if r.price_kind == "估" and r.day_pct is not None and hit(f"fund:{r.code}", -r.day_pct, fund_th):
+                    lines.append(f"{r.name} 估算 {r.day_pct:+.2f}%，超过 {fund_th:g}% 提醒线")
+            if lines:
+                text = "\n".join([f"⏱️ 盘中估值提醒 {now:%H:%M}"] + [f"· {x}" for x in lines])
+                text += "\n估值按季报持仓推算，常与当晚净值有偏差，以净值为准。不构成投资建议。"
+                await self._send(st, text)
+        # 清掉前一天的记录
+        self._intra_levels = {k: v for k, v in self._intra_levels.items() if k[1] == today}
+
+    async def _tick_preclose(self, now: datetime) -> None:
+        t = str(self.config.get("preclose_push_time", "14:45") or "").strip()
+        if not re.fullmatch(r"\d{2}:\d{2}", t) or now.weekday() >= 5:
+            return
+        hm, today = now.strftime("%H:%M"), now.strftime("%Y-%m-%d")
+        if not (t <= hm < "15:00"):
+            return
+        for st in self.storage.subscribers():
+            key = f"preclose:{st.user_id}"
+            if self.storage.get_meta(key) == today:
+                continue
+            status, text, img, extra = await self._build_report(st.user_id, st, "preclose", now)
+            if status == "wait":
+                continue
+            if status == "ok":
+                await self._send(st, text, img, extra)
+            self.storage.set_meta(key, today)
+
     # ------------------------------------------------------------ 周报
     async def _commentary(self, prompt: str, umo: str | None) -> str:
         """让大模型写一段中性点评；没有可用模型或出错时返回空串。"""
@@ -354,8 +585,10 @@ class FundBoard(Star):
             except DataSourceError:
                 trends[c] = []
         series = self.storage.index_series(uid, monday.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d"))
-        trades = self.storage.trades_since(uid, monday.timestamp())
+        trades = self._merged_trades(uid, monday.timestamp())
         report = build_week(summary, trends, series, trades, a.flags, now)
+        for name, (_code, trend) in (await self._bench_trends()).items():
+            report.benches.append((name, fund_week_return(trend, monday)[0]))
         commentary = ""
         if report.ret is not None:
             commentary = await self._commentary(llm_prompt(report, show_amount), umo)
@@ -367,7 +600,7 @@ class FundBoard(Star):
         yield event.plain_result("正在生成本周周报，请稍候…")
         try:
             text = await self._weekly_text(
-                self._uid(event), self._show_amount(event), event.unified_msg_origin, datetime.now(CN_TZ)
+                self._base(event), self._show_amount(event), event.unified_msg_origin, datetime.now(CN_TZ)
             )
         except DataSourceError as e:
             logger.error(f"[fund_board] 周报失败: {e}")
@@ -388,7 +621,7 @@ class FundBoard(Star):
         """
         if not self._tools_on():
             return "管理员已关闭基金持仓查询工具。"
-        holdings = self.storage.list(self._uid(event))
+        holdings = self._merged_holdings(self._base(event))
         if not holdings:
             return "用户还没有在插件里记录基金持仓。可以告诉用户用 /fund add 或 /fund import 添加。"
         code = (scope or "").strip()
@@ -440,6 +673,24 @@ class FundBoard(Star):
             pass
         return "\n".join(lines) + "\n" + TOOL_NOTE
 
+    @filter.llm_tool(name="fund_performance")
+    async def tool_performance(self, event: AstrMessageEvent, period: str = "全部"):
+        """查询当前用户基金组合的收益表现：时间加权收益、XIRR 年化、最大回撤，以及与沪深300、纳指100等基准的同期对比。用户问"我今年收益多少""跑赢大盘了吗""年化多少"时调用。
+
+        Args:
+            period(string): 区间，可选 近1月、近3月、近6月、近1年、今年、全部
+        """
+        if not self._tools_on():
+            return "管理员已关闭基金收益查询工具。"
+        rn = self._parse_range(period) or "全部"
+        try:
+            p = await self._perf(self._base(event), rn, datetime.now(CN_TZ))
+        except DataSourceError:
+            return "暂时取不到数据，请稍后再试。"
+        if not p:
+            return "用户还没有在插件里记录基金持仓。"
+        return render_perf(p, self._show_amount(event)) + "\n" + TOOL_NOTE
+
     @filter.llm_tool(name="fund_checkup")
     async def tool_checkup(self, event: AstrMessageEvent, focus: str = "overview"):
         """对当前用户记录的基金组合做体检：穿透重仓股后的个股和行业暴露、基金之间的持仓重叠、集中度、近一年回撤、经理任职。用户问持仓是否集中、基金是否重复、风险在哪里、买了哪些股票等问题时调用。
@@ -450,7 +701,7 @@ class FundBoard(Star):
         if not self._tools_on():
             return "管理员已关闭基金体检工具。"
         try:
-            res = await self._analyze(self._uid(event))
+            res = await self._analyze(self._base(event))
         except DataSourceError:
             return "暂时取不到数据，请稍后再试。"
         if not res:
@@ -527,7 +778,7 @@ class FundBoard(Star):
     @fund.command("push", alias={"推送"})
     async def push(self, event: AstrMessageEvent, action: str = ""):
         """每日推送：/fund push on|off|now"""
-        uid = self._uid(event)
+        uid = self._base(event)
         st = self.storage.get_settings(uid)
         close_t, nav_t = self._cfg_time("close_push_time", "15:05"), self._cfg_time("nav_push_time", "21:30")
         a = action.strip().lower()
@@ -563,7 +814,7 @@ class FundBoard(Star):
     @fund.command("alert", alias={"提醒"})
     async def alert(self, event: AstrMessageEvent, kind: str = "", value: str = ""):
         """提醒阈值：/fund alert day 3 ｜ /fund alert dd 20"""
-        uid = self._uid(event)
+        uid = self._base(event)
         st = self.storage.get_settings(uid)
         k = kind.strip().lower()
         if k in ("day", "dd", "单日", "回撤"):
@@ -614,7 +865,7 @@ class FundBoard(Star):
         状态：ok / wait（净值未出齐，稍后再试）/ skip（非交易日或无持仓）。
         开启图片模式时，看板渲染成图片，提醒仍以文字附在后面。
         """
-        holdings = self.storage.list(uid)
+        holdings = self._merged_holdings(uid)
         if not holdings:
             return "skip", "", None, ""
         codes = [h.code for h in holdings]
@@ -624,7 +875,7 @@ class FundBoard(Star):
             logger.error(f"[fund_board] 推送取行情失败: {e}")
             return "wait", "", None, ""
         today = now.strftime("%Y-%m-%d")
-        if mode in ("close", "nav") and not has_trading_today(quotes, today):
+        if mode in ("close", "nav", "preclose") and not has_trading_today(quotes, today):
             return "skip", "", None, ""
         retry_until = self._cfg_time("nav_retry_until", "23:30")
         if mode == "nav":
@@ -640,7 +891,7 @@ class FundBoard(Star):
         extra: list[str] = []
         day_th, dd_th = self._thresholds(st)
 
-        if mode == "close":
+        if mode in ("close", "preclose"):
             if day_th > 0 and summary.day_pct is not None and summary.day_pct <= -day_th:
                 extra.append(f"⚠️ 按盘中估值，组合今日约下跌 {abs(summary.day_pct):.2f}%，超过 {day_th:g}% 提醒线。")
         else:
@@ -660,7 +911,7 @@ class FundBoard(Star):
         text = render_board(summary, show, now, REPORT_TITLES[mode]) + (f"\n\n{extra_text}" if extra else "")
         img = None
         if self._want_image(""):
-            realized = self.storage.realized_total(uid)
+            realized = self._merged_realized(uid)
             data = board_data(summary, show, REPORT_TITLES[mode], now, realized if show else 0.0)
             img = await self._render_img(BOARD_TMPL, data, st.umo)
         return "ok", text, img, extra_text
@@ -711,7 +962,7 @@ class FundBoard(Star):
         if not ("08:00" <= now.strftime("%H:%M") <= "23:30"):
             return
         for st in self.storage.subscribers():
-            holdings = self.storage.list(st.user_id)
+            holdings = self._merged_holdings(st.user_id)
             if not holdings:
                 continue
             try:
@@ -750,6 +1001,9 @@ class FundBoard(Star):
     async def _tick(self, now: datetime) -> None:
         await self._tick_weekly(now)
         await self._tick_qdii(now)
+        await self._tick_snapshot(now)
+        await self._tick_intraday(now)
+        await self._tick_preclose(now)
         if now.weekday() >= 5:  # 周末不推送日报；节假日由"今天有没有估值/净值"判断
             return
         hm, today = now.strftime("%H:%M"), now.strftime("%Y-%m-%d")
@@ -902,7 +1156,16 @@ class FundBoard(Star):
                     controller.stop()
                     return
                 replace_all = text == "确认覆盖"
-                self.storage.upsert_many(uid, [(r.code, r.name, r.shares, r.cost) for r in rows], replace_all)
+                navs = {c: q.nav for c, q in quotes.items() if q.nav}
+                others = [c for c in existing if c not in navs]
+                if replace_all and others:
+                    try:
+                        navs.update({c: q.nav for c, q in (await self.ds.get_quotes(others)).items() if q.nav})
+                    except DataSourceError:
+                        pass
+                self.storage.upsert_many(
+                    uid, [(r.code, r.name, r.shares, r.cost) for r in rows], replace_all, navs=navs
+                )
                 total = sum(r.amount for r in rows)
                 cost = sum(r.cost for r in rows)
                 msg = f"✅ 已{'覆盖' if replace_all else '合并'}导入 {len(rows)} 只基金。"
