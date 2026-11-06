@@ -111,3 +111,46 @@ def build_summary(holdings: list[Holding], quotes: dict[str, Quote], now: dateti
             s.cost -= r.cost
     s.rows.sort(key=lambda r: (r.market_value is None, -(r.market_value or 0)))
     return s
+
+
+def drawdown_from_trend(trend: list[tuple[int, float]], days: int = 365) -> tuple[float, float, int] | None:
+    """近 N 天累计净值走势里，最新值较最高点的回撤。
+
+    返回 (回撤%, 最高值, 最高点时间戳毫秒)，回撤为正数；数据不足返回 None。
+    """
+    if not trend:
+        return None
+    last_ts = trend[-1][0]
+    window = [p for p in trend if p[0] >= last_ts - days * 86400 * 1000]
+    if len(window) < 2:
+        return None
+    peak_ts, peak = max(window, key=lambda p: p[1])
+    latest = window[-1][1]
+    if peak <= 0:
+        return None
+    return (1 - latest / peak) * 100, peak, peak_ts
+
+
+def nav_readiness(quotes: dict[str, Quote], codes: list[str], today: str) -> tuple[list[str], list[str]]:
+    """判断今天的净值是否已公布。
+
+    返回 (已公布今日净值的代码, 预计今天会公布但还没出的代码)。
+    今天有盘中估值、但净值日期不是今天的，视为"还没出"；QDII 这类没有估值的不等待。
+    """
+    ready, pending = [], []
+    for c in codes:
+        q = quotes.get(c)
+        if not q:
+            continue
+        if q.nav_date == today:
+            ready.append(c)
+        elif q.est_time and q.est_time[:10] == today:
+            pending.append(c)
+    return ready, pending
+
+
+def has_trading_today(quotes: dict[str, Quote], today: str) -> bool:
+    """今天是否交易日：只要有一只基金有今天的估值或净值即可判断。"""
+    return any(
+        (q.est_time and q.est_time[:10] == today) or q.nav_date == today for q in quotes.values()
+    )

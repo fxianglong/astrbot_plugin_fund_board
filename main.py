@@ -1,10 +1,11 @@
 import asyncio
 import re
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
@@ -20,9 +21,10 @@ from .importer import (
     resolved_codes,
 )
 from .importer import _to_money as to_money
-from .portfolio import build_summary
-from .render import DISCLAIMER, HELP, render_board, render_list
-from .storage import Storage
+from . import alerts
+from .portfolio import CN_TZ, build_summary, drawdown_from_trend, has_trading_today, nav_readiness
+from .render import DISCLAIMER, HELP, render_board, render_list, render_trades
+from .storage import Settings, Storage
 
 PLUGIN_NAME = "astrbot_plugin_fund_board"
 CONFIRM_WORDS = {"确认", "确认合并", "确认覆盖"}
@@ -31,7 +33,10 @@ CANCEL_WORDS = {"取消", "退出", "算了"}
 PRIVACY_NOTE = "提示：截图会发送给当前配置的大模型服务商识别，请确认你接受。识别结果只保存在本机 AstrBot 的数据库里。"
 
 
-@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图一键导入", "0.1.0")
+REPORT_TITLES = {"close": "🔔 收盘估值", "nav": "🌙 净值日报", "manual": "📊 持仓日报"}
+
+
+@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送与回撤提醒", "0.2.0")
 class FundBoard(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -45,8 +50,25 @@ class FundBoard(Star):
         self.storage = Storage(data_dir / "fund_board.db")
         self.ds = FundDataSource(data_dir, timeout=int(config.get("request_timeout", 10) or 10))
         self._matcher: FundMatcher | None = None
+        self._nav_next_try: datetime | None = None
+        self._task = asyncio.create_task(self._scheduler_loop())
 
     # ------------------------------------------------------------ 工具方法
+    def _cfg_time(self, key: str, default: str) -> str:
+        v = str(self.config.get(key, default) or default).strip()
+        return v if re.fullmatch(r"\d{2}:\d{2}", v) else default
+
+    def _thresholds(self, st: Settings) -> tuple[float, float]:
+        day = st.day_alert if st.day_alert is not None else float(self.config.get("default_day_alert", 3) or 0)
+        dd = st.dd_alert if st.dd_alert is not None else float(self.config.get("default_dd_alert", 20) or 0)
+        return day, dd
+
+    async def _quote_one(self, code: str):
+        try:
+            return (await self.ds.get_quotes([code])).get(code)
+        except DataSourceError:
+            return None
+
     @staticmethod
     def _uid(event: AstrMessageEvent) -> str:
         return f"{event.get_platform_id()}:{event.get_sender_id()}"
@@ -95,7 +117,11 @@ class FundBoard(Star):
             yield event.plain_result("获取行情失败，请稍后再试。")
             return
         summary = build_summary(holdings, quotes)
-        yield event.plain_result(render_board(summary, self._show_amount(event)))
+        text = render_board(summary, self._show_amount(event))
+        realized = self.storage.realized_total(self._uid(event))
+        if realized and self._show_amount(event):
+            text += f"\n已实现盈亏（卖出记录合计）：{realized:+,.2f}"
+        yield event.plain_result(text)
 
     @fund.command("list", alias={"持仓"})
     async def list_(self, event: AstrMessageEvent):
@@ -184,6 +210,245 @@ class FundBoard(Star):
             pass
         lines.append(DISCLAIMER)
         yield event.plain_result("\n".join(lines))
+
+    # ------------------------------------------------------------ 交易记录
+    @fund.command("buy", alias={"买入", "加仓"})
+    async def buy(self, event: AstrMessageEvent, code: str, amount: str, nav: str = ""):
+        """记录加仓：/fund buy 代码 金额 [净值]"""
+        code = code.strip()
+        amt = to_money(amount)
+        if not re.fullmatch(r"\d{6}", code) or amt is None or amt <= 0:
+            yield event.plain_result("格式：/fund buy 代码 金额 [净值]，例如 /fund buy 016370 1000")
+            return
+        q = await self._quote_one(code)
+        price = to_money(nav) if nav else (q.nav if q else None)
+        if not price or price <= 0:
+            yield event.plain_result(f"没查到 {code} 的净值，可以手动指定：/fund buy {code} {amount} 净值")
+            return
+        name = (q.name if q else "") or code
+        h, t = self.storage.buy(self._uid(event), code, name, amt, price)
+        msg = f"已记录买入 {name}（{code}）"
+        if self._show_amount(event):
+            msg += (
+                f"\n金额 {amt:,.2f} ｜ 按净值 {price} 计 {t.shares:,.2f} 份"
+                f"\n现持有 {h.shares:,.2f} 份 ｜ 成本 {h.cost:,.2f}"
+            )
+        if not nav:
+            msg += "\n（按最新净值估算份额，实际以基金公司确认为准；确认后可用 /fund add 校准）"
+        yield event.plain_result(msg)
+
+    @fund.command("sell", alias={"卖出", "赎回"})
+    async def sell(self, event: AstrMessageEvent, code: str, shares: str, nav: str = ""):
+        """记录赎回：/fund sell 代码 份额|全部 [净值]"""
+        code = code.strip()
+        uid = self._uid(event)
+        h = self.storage.get(uid, code)
+        if not h:
+            yield event.plain_result(f"持仓里没有 {code}")
+            return
+        n = h.shares if shares.strip() in ("全部", "all", "ALL") else to_money(shares)
+        if n is None or n <= 0:
+            yield event.plain_result("格式：/fund sell 代码 份额|全部 [净值]，例如 /fund sell 016370 全部")
+            return
+        q = await self._quote_one(code)
+        price = to_money(nav) if nav else (q.nav if q else None)
+        if not price or price <= 0:
+            yield event.plain_result(f"没查到 {code} 的净值，可以手动指定：/fund sell {code} {shares} 净值")
+            return
+        try:
+            left, t = self.storage.sell(uid, code, n, price)
+        except ValueError as e:
+            yield event.plain_result(str(e))
+            return
+        msg = f"已记录卖出 {h.name}（{code}）"
+        if self._show_amount(event):
+            msg += f"\n{t.shares:,.2f} 份 × 净值 {price} = {t.amount:,.2f} ｜ 实现盈亏 {t.realized:+,.2f}"
+            msg += f"\n剩余 {left.shares:,.2f} 份 ｜ 成本 {left.cost:,.2f}" if left else "\n已全部卖出，持仓已移除"
+        elif not left:
+            msg += "，已全部卖出"
+        yield event.plain_result(msg)
+
+    @fund.command("trades", alias={"交易"})
+    async def trades(self, event: AstrMessageEvent, code: str = ""):
+        """最近交易记录"""
+        rows = self.storage.trades(self._uid(event), code.strip() or None, limit=15)
+        yield event.plain_result(render_trades(rows, self._show_amount(event)))
+
+    # ------------------------------------------------------------ 推送与提醒
+    @fund.command("push", alias={"推送"})
+    async def push(self, event: AstrMessageEvent, action: str = ""):
+        """每日推送：/fund push on|off|now"""
+        uid = self._uid(event)
+        st = self.storage.get_settings(uid)
+        close_t, nav_t = self._cfg_time("close_push_time", "15:05"), self._cfg_time("nav_push_time", "21:30")
+        a = action.strip().lower()
+        if a in ("on", "开", "开启"):
+            st.umo, st.private, st.push_on = event.unified_msg_origin, event.is_private_chat(), True
+            self.storage.save_settings(st)
+            where = "当前私聊" if st.private else "当前群聊（只显示百分比）"
+            yield event.plain_result(
+                f"已开启每日推送，发到{where}。\n交易日 {close_t} 推送收盘估值，{nav_t} 起推送净值日报和回撤提醒。"
+            )
+        elif a in ("off", "关", "关闭"):
+            st.push_on = False
+            self.storage.save_settings(st)
+            yield event.plain_result("已关闭每日推送。")
+        elif a in ("now", "test", "测试"):
+            st_tmp = Settings(uid, event.unified_msg_origin, event.is_private_chat(), True, st.day_alert, st.dd_alert)
+            status, text = await self._build_report(uid, st_tmp, "manual", datetime.now(CN_TZ))
+            yield event.plain_result(text if status == "ok" else "还没有持仓，或暂时取不到行情。")
+        else:
+            state = "已开启" if st.push_on else "未开启"
+            yield event.plain_result(
+                f"每日推送：{state}\n交易日 {close_t} 收盘估值，{nav_t} 起净值日报。\n"
+                "开启：/fund push on（发到当前会话） ｜ 关闭：/fund push off ｜ 立即推送一次：/fund push now"
+            )
+
+    @fund.command("alert", alias={"提醒"})
+    async def alert(self, event: AstrMessageEvent, kind: str = "", value: str = ""):
+        """提醒阈值：/fund alert day 3 ｜ /fund alert dd 20"""
+        uid = self._uid(event)
+        st = self.storage.get_settings(uid)
+        k = kind.strip().lower()
+        if k in ("day", "dd", "单日", "回撤"):
+            v = to_money(value)
+            if v is None or v < 0 or v >= 100:
+                yield event.plain_result("请输入 0～99 之间的数字，0 表示关闭。例如 /fund alert dd 20")
+                return
+            if k in ("day", "单日"):
+                st.day_alert = v
+            else:
+                st.dd_alert = v
+            self.storage.save_settings(st)
+        elif k in ("off", "关闭"):
+            st.day_alert = st.dd_alert = 0
+            self.storage.save_settings(st)
+        elif k:
+            yield event.plain_result("用法：/fund alert day 3 ｜ /fund alert dd 20 ｜ /fund alert off")
+            return
+        day, dd = self._thresholds(st)
+        lines = [
+            "🔔 提醒设置",
+            f"组合单日跌幅：{f'超过 {day:g}% 提醒' if day > 0 else '关闭'}",
+            f"回撤（组合及单只基金）：{f'超过 {dd:g}% 提醒，之后每加深 5% 再提醒一次' if dd > 0 else '关闭'}",
+            "提醒随每日净值日报发送，需要先 /fund push on 开启推送。",
+        ]
+        if not st.push_on:
+            lines.append("⚠️ 你还没有开启每日推送。")
+        yield event.plain_result("\n".join(lines))
+
+    async def _fund_drawdowns(self, codes: list[str]) -> dict[str, tuple[float, float, int]]:
+        out = {}
+        for c in codes:
+            try:
+                r = drawdown_from_trend(await self.ds.get_ac_trend(c))
+            except DataSourceError as e:
+                logger.warning(f"[fund_board] 获取 {c} 走势失败: {e}")
+                continue
+            if r:
+                out[c] = r
+        return out
+
+    async def _build_report(self, uid: str, st: Settings, mode: str, now: datetime) -> tuple[str, str]:
+        """生成推送内容。返回 (状态, 文本)，状态：ok / wait（净值未出齐，稍后再试）/ skip（非交易日或无持仓）。"""
+        holdings = self.storage.list(uid)
+        if not holdings:
+            return "skip", ""
+        codes = [h.code for h in holdings]
+        try:
+            quotes = await self.ds.get_quotes(codes)
+        except DataSourceError as e:
+            logger.error(f"[fund_board] 推送取行情失败: {e}")
+            return "wait", ""
+        today = now.strftime("%Y-%m-%d")
+        if mode in ("close", "nav") and not has_trading_today(quotes, today):
+            return "skip", ""
+        retry_until = self._cfg_time("nav_retry_until", "23:30")
+        if mode == "nav":
+            ready, pending = nav_readiness(quotes, codes, today)
+            late = now.strftime("%H:%M") >= retry_until
+            if (pending or not ready) and not late:
+                return "wait", ""
+            if not ready:
+                return "skip", ""
+
+        summary = build_summary(holdings, quotes, now)
+        show = st.private or bool(self.config.get("group_show_amount", False))
+        lines = [render_board(summary, show, now, REPORT_TITLES[mode])]
+        day_th, dd_th = self._thresholds(st)
+
+        if mode == "close":
+            if day_th > 0 and summary.day_pct is not None and summary.day_pct <= -day_th:
+                lines.append(f"⚠️ 按盘中估值，组合今日约下跌 {abs(summary.day_pct):.2f}%，超过 {day_th:g}% 提醒线。")
+        else:
+            portfolio = None
+            if mode == "nav" and summary.day_pct is not None:
+                portfolio = self.storage.record_index(uid, today, summary.day_pct)
+            elif mode == "manual":
+                portfolio = self.storage.latest_index(uid)
+            fund_dds = await self._fund_drawdowns(codes) if dd_th > 0 else {}
+            alert_lines = alerts.evaluate(
+                self.storage, uid, summary, day_th, dd_th, portfolio, fund_dds, dry=(mode == "manual")
+            )
+            if alert_lines:
+                lines.append("")
+                lines.extend(alert_lines)
+        return "ok", "\n".join(lines)
+
+    async def _send(self, st: Settings, text: str) -> None:
+        try:
+            ok = await self.context.send_message(st.umo, MessageChain().message(text))
+            if not ok:
+                logger.warning(f"[fund_board] 推送失败，找不到会话 {st.umo}")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[fund_board] 推送出错 {st.umo}: {e}")
+
+    async def _tick(self, now: datetime) -> None:
+        if now.weekday() >= 5:  # 周末不推送；节假日由"今天有没有估值/净值"判断
+            return
+        hm, today = now.strftime("%H:%M"), now.strftime("%Y-%m-%d")
+        close_t, nav_t = self._cfg_time("close_push_time", "15:05"), self._cfg_time("nav_push_time", "21:30")
+        subs = self.storage.subscribers()
+
+        if close_t <= hm < nav_t:
+            for st in subs:
+                if st.last_close == today:
+                    continue
+                status, text = await self._build_report(st.user_id, st, "close", now)
+                if status == "wait":
+                    continue
+                if status == "ok":
+                    await self._send(st, text)
+                st.last_close = today
+                self.storage.save_settings(st)
+
+        if hm >= nav_t:
+            if self._nav_next_try and now < self._nav_next_try:
+                return
+            waiting = False
+            for st in subs:
+                if st.last_nav == today:
+                    continue
+                status, text = await self._build_report(st.user_id, st, "nav", now)
+                if status == "wait":
+                    waiting = True
+                    continue
+                if status == "ok":
+                    await self._send(st, text)
+                st.last_nav = today
+                self.storage.save_settings(st)
+            self._nav_next_try = now + timedelta(minutes=30) if waiting else None
+
+    async def _scheduler_loop(self) -> None:
+        await asyncio.sleep(15)  # 等 AstrBot 各平台加载完
+        while True:
+            try:
+                await self._tick(datetime.now(CN_TZ))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"[fund_board] 定时任务出错: {e}")
+            await asyncio.sleep(30)
 
     # ------------------------------------------------------------ 截图导入
     async def _recognize(self, event: AstrMessageEvent, images: list[str]):
@@ -315,5 +580,6 @@ class FundBoard(Star):
             event.stop_event()
 
     async def terminate(self):
+        self._task.cancel()
         await self.ds.close()
         self.storage.close()
