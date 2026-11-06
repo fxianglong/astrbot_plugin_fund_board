@@ -160,5 +160,11 @@
     "type": "string",
     "default": "20:00",
     "hint": "北京时间。只发给开启了每日推送的用户；没开推送可随时 /fund review 查看。"
+  },
+  "fund_change_alert": {
+    "description": "基金异动提醒",
+    "type": "bool",
+    "default": true,
+    "hint": "净值日报里对比持有基金的经理、申购/赎回状态和分红，有变化就提醒。"
   }
 }

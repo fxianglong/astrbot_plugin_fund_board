@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -112,6 +113,14 @@ class Storage:
                 PRIMARY KEY (user_id, date));
             -- 回撤提醒的已提醒档位，避免每天重复提醒同一档
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            -- v0.8 基金状态快照（异动对比）、自选、账户
+            CREATE TABLE IF NOT EXISTS fund_state (
+                user_id TEXT NOT NULL, code TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY (user_id, code));
+            CREATE TABLE IF NOT EXISTS watchlist (
+                user_id TEXT NOT NULL, code TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', alert_pct REAL,
+                PRIMARY KEY (user_id, code));
+            CREATE TABLE IF NOT EXISTS accounts (
+                user_id TEXT NOT NULL, name TEXT NOT NULL, PRIMARY KEY (user_id, name));
             -- v0.7 决策日志与定投
             CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, code TEXT NOT NULL,
@@ -535,6 +544,154 @@ class Storage:
             (plan_id,),
         ).fetchall()
         return [Trade(*r) for r in rows]
+
+    # ------------------------------------------------------------ 基金状态（异动）
+    def get_state(self, user_id: str, code: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT data FROM fund_state WHERE user_id=? AND code=?", (user_id, code)
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def set_state(self, user_id: str, code: str, data: dict) -> None:
+        self.conn.execute(
+            "INSERT INTO fund_state (user_id, code, data) VALUES (?,?,?) "
+            "ON CONFLICT(user_id, code) DO UPDATE SET data=excluded.data",
+            (user_id, code, json.dumps(data, ensure_ascii=False)),
+        )
+        self.conn.commit()
+
+    # ------------------------------------------------------------ 自选
+    def watch_add(self, user_id: str, code: str, name: str, alert_pct: float | None) -> None:
+        self.conn.execute(
+            "INSERT INTO watchlist (user_id, code, name, alert_pct) VALUES (?,?,?,?) "
+            "ON CONFLICT(user_id, code) DO UPDATE SET name=excluded.name, alert_pct=excluded.alert_pct",
+            (user_id, code, name, alert_pct),
+        )
+        self.conn.commit()
+
+    def watch_del(self, user_id: str, code: str) -> bool:
+        cur = self.conn.execute("DELETE FROM watchlist WHERE user_id=? AND code=?", (user_id, code))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def watchlist(self, user_id: str) -> list[tuple[str, str, float | None]]:
+        return self.conn.execute(
+            "SELECT code, name, alert_pct FROM watchlist WHERE user_id=? ORDER BY rowid", (user_id,)
+        ).fetchall()
+
+    # ------------------------------------------------------------ 账户
+    def accounts(self, user_id: str) -> list[str]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT name FROM accounts WHERE user_id=? ORDER BY rowid", (user_id,)
+        ).fetchall()]
+
+    def add_account(self, user_id: str, name: str) -> None:
+        self.conn.execute("INSERT OR IGNORE INTO accounts (user_id, name) VALUES (?,?)", (user_id, name))
+        self.conn.commit()
+
+    def del_account(self, user_id: str, name: str) -> None:
+        self.conn.execute("DELETE FROM accounts WHERE user_id=? AND name=?", (user_id, name))
+        self.conn.commit()
+
+    # ------------------------------------------------------------ 备份与恢复
+    EXPORT_TABLES = {
+        "holdings": ("code", "name", "shares", "cost", "updated_at"),
+        "trades": ("id", "code", "name", "kind", "amount", "shares", "nav", "realized", "ts", "sip_id"),
+        "sip_plans": ("id", "code", "name", "amount", "rule", "fee_rate", "active", "created", "last_date"),
+    }
+    BASE_TABLES = {
+        "notes": ("code", "name", "kind", "text", "trade_id", "amount", "ts", "reviewed"),
+        "tags": ("code", "tag"),
+        "targets": ("tag", "pct"),
+        "watchlist": ("code", "name", "alert_pct"),
+    }
+
+    def export_user(self, base: str, accounts: list[str]) -> dict[str, list[dict]]:
+        """导出一个用户的全部数据。按账户存的表多一列 account（默认账户为空）。"""
+        out: dict[str, list[dict]] = {}
+        uids = [(base, "")] + [(f"{base}#{a}", a) for a in accounts]
+        for table, cols in self.EXPORT_TABLES.items():
+            rows = []
+            for uid, acct in uids:
+                for r in self.conn.execute(
+                    f"SELECT {', '.join(cols)} FROM {table} WHERE user_id=? ORDER BY rowid", (uid,)
+                ).fetchall():
+                    rows.append({"account": acct, **dict(zip(cols, r))})
+            out[table] = rows
+        for table, cols in self.BASE_TABLES.items():
+            out[table] = [dict(zip(cols, r)) for r in self.conn.execute(
+                f"SELECT {', '.join(cols)} FROM {table} WHERE user_id=? ORDER BY rowid", (base,)
+            ).fetchall()]
+        out["accounts"] = [{"name": a} for a in accounts]
+        return out
+
+    def restore_user(self, base: str, data: dict[str, list[dict]]) -> dict[str, int]:
+        """用备份覆盖该用户的持仓、交易、定投、笔记、标签、目标、自选和账户。trade_id、sip_id 会重新映射。"""
+        def uid_of(acct: str) -> str:
+            return f"{base}#{acct}" if acct else base
+
+        old_accounts = self.accounts(base)
+        all_uids = [base] + [f"{base}#{a}" for a in old_accounts]
+        counts = {}
+        with self.conn:
+            for u in all_uids:
+                for table in self.EXPORT_TABLES:
+                    self.conn.execute(f"DELETE FROM {table} WHERE user_id=?", (u,))
+            for table in list(self.BASE_TABLES) + ["accounts"]:
+                self.conn.execute(f"DELETE FROM {table} WHERE user_id=?", (base,))
+            for a in data.get("accounts", []):
+                if a.get("name"):
+                    self.conn.execute("INSERT OR IGNORE INTO accounts (user_id, name) VALUES (?,?)", (base, a["name"]))
+            sip_map, trade_map = {}, {}
+            for r in data.get("sip_plans", []):
+                cur = self.conn.execute(
+                    "INSERT INTO sip_plans (user_id, code, name, amount, rule, fee_rate, active, created, last_date) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (uid_of(r.get("account", "")), r["code"], r.get("name", ""), float(r["amount"]), r["rule"],
+                     float(r.get("fee_rate") or 0), int(r.get("active") or 0), float(r["created"]),
+                     r.get("last_date") or ""),
+                )
+                sip_map[str(r.get("id"))] = cur.lastrowid
+            for r in data.get("trades", []):
+                sid = r.get("sip_id")
+                cur = self.conn.execute(
+                    "INSERT INTO trades (user_id, code, name, kind, amount, shares, nav, realized, ts, sip_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (uid_of(r.get("account", "")), r["code"], r.get("name", ""), r["kind"], float(r["amount"]),
+                     float(r.get("shares") or 0), float(r.get("nav") or 0), float(r.get("realized") or 0),
+                     float(r["ts"]), sip_map.get(str(sid)) if sid not in (None, "") else None),
+                )
+                trade_map[str(r.get("id"))] = cur.lastrowid
+            for r in data.get("holdings", []):
+                self.conn.execute(
+                    _UPSERT_HOLDING,
+                    (uid_of(r.get("account", "")), r["code"], r.get("name", ""), float(r["shares"]),
+                     float(r["cost"]), float(r.get("updated_at") or time.time())),
+                )
+            for r in data.get("notes", []):
+                tid = r.get("trade_id")
+                self.conn.execute(
+                    "INSERT INTO notes (user_id, code, name, kind, text, trade_id, amount, ts, reviewed) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    (base, r["code"], r.get("name", ""), r["kind"], r["text"],
+                     trade_map.get(str(tid)) if tid not in (None, "") else None,
+                     float(r.get("amount") or 0), float(r["ts"]), r.get("reviewed") or ""),
+                )
+            for r in data.get("tags", []):
+                self.conn.execute("INSERT OR REPLACE INTO tags (user_id, code, tag) VALUES (?,?,?)",
+                                  (base, r["code"], r["tag"]))
+            for r in data.get("targets", []):
+                self.conn.execute("INSERT OR REPLACE INTO targets (user_id, tag, pct) VALUES (?,?,?)",
+                                  (base, r["tag"], float(r["pct"])))
+            for r in data.get("watchlist", []):
+                ap = r.get("alert_pct")
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO watchlist (user_id, code, name, alert_pct) VALUES (?,?,?,?)",
+                    (base, r["code"], r.get("name", ""), float(ap) if ap not in (None, "") else None),
+                )
+        for k in ("holdings", "trades", "sip_plans", "notes"):
+            counts[k] = len(data.get(k, []))
+        return counts
 
     # ------------------------------------------------------------ 标签与目标
     def set_tag(self, user_id: str, code: str, tag: str | None) -> None:

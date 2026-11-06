@@ -40,6 +40,17 @@ from .journal import (
     scheduled_dates,
     sip_stat,
 )
+from .analysis import pair_overlap
+from .extras import (
+    counterpart,
+    diff_state,
+    fee_rows,
+    pack_zip,
+    render_fees,
+    state_of,
+    unpack_zip,
+    watch_line,
+)
 from .perf import RANGE_ALIASES, RANGES, compute_perf, render_perf
 from .planning import (
     PRESETS,
@@ -83,7 +94,7 @@ PRIVACY_NOTE = "提示：截图会发送给当前配置的大模型服务商识�
 REPORT_TITLES = {"close": "🔔 收盘估值", "nav": "🌙 净值日报", "manual": "📊 持仓日报", "preclose": "⏰ 收盘前估值"}
 
 
-@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.7.0")
+@register(PLUGIN_NAME, "fxianglong", "基金持仓看板：记录持仓、查看盈亏、截图导入、每日推送、回撤提醒、组合体检、AI 周报与自然语言查询", "0.8.0")
 class FundBoard(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -93,6 +104,7 @@ class FundBoard(Star):
         except Exception:  # 兼容旧版本
             data_dir = Path("data") / "plugin_data" / PLUGIN_NAME
         data_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir = data_dir
 
         self.storage = Storage(data_dir / "fund_board.db")
         self.ds = FundDataSource(data_dir, timeout=int(config.get("request_timeout", 10) or 10))
@@ -146,11 +158,16 @@ class FundBoard(Star):
         """当前账户的存储 ID，持仓和交易按这个 ID 存。"""
         return self._account_uid(self._base(event))
 
+    def _account_name(self, base: str) -> str:
+        name = self.storage.get_meta(f"account:{base}") or ""
+        return name if name in self.storage.accounts(base) else "默认"
+
     def _account_uid(self, base: str) -> str:
-        return base  # v0.8 多账户时改为当前选中的账户
+        name = self._account_name(base)
+        return base if name == "默认" else f"{base}#{name}"
 
     def _account_uids(self, base: str) -> list[str]:
-        return [base]  # v0.8 多账户时返回该用户的全部账户
+        return [base] + [f"{base}#{a}" for a in self.storage.accounts(base)]
 
     def _merged_holdings(self, base: str):
         """该用户全部账户的持仓，同一基金合并份额和成本。"""
@@ -205,10 +222,17 @@ class FundBoard(Star):
         yield event.plain_result(HELP)
 
     @fund.command("board", alias={"看板"})
-    async def board(self, event: AstrMessageEvent, mode: str = ""):
-        """持仓看板：/fund board [img|text]"""
+    async def board(self, event: AstrMessageEvent, mode: str = "", mode2: str = ""):
+        """持仓看板：/fund board [all] [img|text]"""
+        base = self._base(event)
+        modes = {mode.strip().lower(), mode2.strip().lower()}
+        merged = bool(modes & {"all", "全部", "合并"})
+        mode = next((m for m in modes if m in ("img", "image", "图", "图片", "text", "txt", "文字")), "")
         uid = self._uid(event)
-        holdings = self.storage.list(uid)
+        holdings = self._merged_holdings(base) if merged else self.storage.list(uid)
+        title = "📊 持仓看板"
+        if self.storage.accounts(base):
+            title += " · 全部账户" if merged else f" · {self._account_name(base)}"
         if not holdings:
             yield event.plain_result(render_list([]))
             return
@@ -220,17 +244,24 @@ class FundBoard(Star):
             return
         summary = build_summary(holdings, quotes)
         show = self._show_amount(event)
-        realized = self.storage.realized_total(uid)
+        realized = self._merged_realized(base) if merged else self.storage.realized_total(uid)
         if self._want_image(mode):
             path = await self._render_img(
-                BOARD_TMPL, board_data(summary, show, "📊 持仓看板", realized=realized), event.unified_msg_origin
+                BOARD_TMPL, board_data(summary, show, title, realized=realized), event.unified_msg_origin
             )
             if path:
                 yield event.image_result(path)
                 return
-        text = render_board(summary, show)
+        text = render_board(summary, show, title=title)
         if realized and show:
             text += f"\n已实现盈亏（卖出记录合计）：{realized:+,.2f}"
+        watch = self.storage.watchlist(base)
+        if watch:
+            try:
+                wq = await self.ds.get_quotes([c for c, _, _ in watch])
+            except DataSourceError:
+                wq = {}
+            text += "\n👀 自选\n" + "\n".join(watch_line(c, n, wq.get(c), a) for c, n, a in watch)
         yield event.plain_result(text)
 
     # ------------------------------------------------------------ 分析
@@ -371,7 +402,10 @@ class FundBoard(Star):
     async def list_(self, event: AstrMessageEvent):
         """持仓明细"""
         holdings = self.storage.list(self._uid(event))
-        yield event.plain_result(render_list(holdings, self._show_amount(event)))
+        text = render_list(holdings, self._show_amount(event))
+        if self.storage.accounts(self._base(event)) and holdings:
+            text = text.replace("📁 我的持仓", f"📁 我的持仓 · {self._account_name(self._base(event))}", 1)
+        yield event.plain_result(text)
 
     @fund.command("add", alias={"添加"})
     async def add(self, event: AstrMessageEvent, code: str, amount: str, profit: str = "0"):
@@ -604,6 +638,17 @@ class FundBoard(Star):
             for r in summary.rows:
                 if r.price_kind == "估" and r.day_pct is not None and hit(f"fund:{r.code}", -r.day_pct, fund_th):
                     lines.append(f"{r.name} 估算 {r.day_pct:+.2f}%，超过 {fund_th:g}% 提醒线")
+            watch = [(c, n, a) for c, n, a in self.storage.watchlist(st.user_id) if a]
+            if watch:
+                try:
+                    wq = await self.ds.get_quotes([c for c, _, _ in watch])
+                except DataSourceError:
+                    wq = {}
+                for c, n, a in watch:
+                    q = wq.get(c)
+                    if q and q.est_pct is not None and q.est_time and q.est_time[:10] == today \
+                            and hit(f"watch:{c}", abs(q.est_pct), a):
+                        lines.append(f"自选 {q.name or n} 估算 {q.est_pct:+.2f}%，超过 {a:g}% 提醒线")
             if lines:
                 text = "\n".join([f"⏱️ 盘中估值提醒 {now:%H:%M}"] + [f"· {x}" for x in lines])
                 text += "\n估值按季报持仓推算，常与当晚净值有偏差，以净值为准。不构成投资建议。"
@@ -903,6 +948,242 @@ class FundBoard(Star):
                 self._sip_done.setdefault(base, []).append(
                     (today.strftime("%Y-%m-%d"), f"📆 定投已记账：{p.name} {p.amount:,.0f} 元（{eff_date:%m-%d} 净值 {nav}）")
                 )
+
+    # ------------------------------------------------------------ 多账户（v0.8）
+    @fund.command("account", alias={"账户"})
+    async def account(self, event: AstrMessageEvent, action: str = "", name: str = ""):
+        """多账户：/fund account [list|add 名称|use 名称|del 名称]"""
+        base = self._base(event)
+        act, name = action.strip().lower(), name.strip()
+        accounts = self.storage.accounts(base)
+        if act in ("add", "新增", "添加"):
+            if not name or "#" in name or len(name) > 10 or name in ("默认", "全部", "all"):
+                yield event.plain_result("账户名 1～10 个字，不能叫「默认」「全部」，例如 /fund account add 招行")
+                return
+            self.storage.add_account(base, name)
+            yield event.plain_result(f"已添加账户「{name}」。发送 /fund account use {name} 切换过去再录入持仓。")
+            return
+        if act in ("use", "切换"):
+            if name != "默认" and name not in accounts:
+                yield event.plain_result(f"没有账户「{name}」，发送 /fund account 查看。")
+                return
+            self.storage.set_meta(f"account:{base}", "" if name == "默认" else name)
+            yield event.plain_result(
+                f"已切换到「{name}」。之后 add、import、buy、sell、sip 都记在这个账户；"
+                "体检、收益、推送始终看全部账户合并的结果。"
+            )
+            return
+        if act in ("del", "删除"):
+            if name not in accounts:
+                yield event.plain_result(f"没有账户「{name}」。")
+                return
+            uid = f"{base}#{name}"
+            if self.storage.list(uid) or self.storage.sips(uid):
+                yield event.plain_result(f"账户「{name}」里还有持仓或定投计划，请先清空（/fund clear 确认）或删除定投。")
+                return
+            self.storage.del_account(base, name)
+            if self.storage.get_meta(f"account:{base}") == name:
+                self.storage.set_meta(f"account:{base}", "")
+            yield event.plain_result(f"已删除账户「{name}」。")
+            return
+        cur = self._account_name(base)
+        lines = ["💼 账户"]
+        for a in ["默认"] + accounts:
+            uid = base if a == "默认" else f"{base}#{a}"
+            n = len(self.storage.list(uid))
+            lines.append(f"{'👉' if a == cur else '　'} {a}：{n} 只基金")
+        lines.append("添加：/fund account add 名称 ｜ 切换：/fund account use 名称 ｜ 合并看板：/fund board all")
+        yield event.plain_result("\n".join(lines))
+
+    # ------------------------------------------------------------ 费用透视（v0.8）
+    @fund.command("fee", alias={"费用", "费率"})
+    async def fee(self, event: AstrMessageEvent):
+        """持仓费用透视"""
+        base = self._base(event)
+        holdings = self._merged_holdings(base)
+        if not holdings:
+            yield event.plain_result(render_list([]))
+            return
+        yield event.plain_result("正在查询各基金费率，请稍候…")
+        try:
+            quotes = await self.ds.get_quotes([h.code for h in holdings])
+            funds = await self.ds.get_fund_list()
+        except DataSourceError:
+            yield event.plain_result("获取数据失败，请稍后再试。")
+            return
+        summary = build_summary(holdings, quotes)
+        fees, basics, pairs = {}, {}, {}
+
+        async def safe(coro):
+            try:
+                return await coro
+            except DataSourceError as e:
+                logger.warning(f"[fund_board] 费率获取失败: {e}")
+                return None
+
+        for r in summary.rows:
+            fees[r.code] = await safe(self.ds.get_fees(r.code))
+            basics[r.code] = await safe(self.ds.get_basic(r.code))
+            other = counterpart(r.name, funds)
+            if other:
+                pairs[r.code] = (other, await safe(self.ds.get_fees(other.code)), await safe(self.ds.get_basic(other.code)))
+        rows = fee_rows(summary.rows, {k: v for k, v in fees.items() if v}, {k: v for k, v in basics.items() if v}, pairs)
+        yield event.plain_result(render_fees(rows, self._show_amount(event)))
+
+    async def _state_changes(self, uid: str, codes: list[str], names: dict[str, str]) -> list[str]:
+        """对比每只基金的经理、申赎状态、分红，有变化就返回提醒行。"""
+        out = []
+        for c in codes:
+            try:
+                profile = await self.ds.get_profile(c)
+                basic = await self.ds.get_basic(c)
+                divs = await self.ds.get_dividends(c)
+            except DataSourceError as e:
+                logger.warning(f"[fund_board] {c} 状态获取失败: {e}")
+                continue
+            new = state_of(profile.managers, basic, divs)
+            out.extend(diff_state(self.storage.get_state(uid, c), new, names.get(c, c)))
+            self.storage.set_state(uid, c, new)
+        return out
+
+    # ------------------------------------------------------------ 自选（v0.8）
+    @fund.command("watch", alias={"自选", "关注"})
+    async def watch(self, event: AstrMessageEvent, action: str = "", code: str = "", alert: str = ""):
+        """自选关注：/fund watch [add 代码 [提醒%]|del 代码|check 代码]"""
+        base = self._base(event)
+        act, code = action.strip().lower(), code.strip()
+        if act in ("add", "添加", "加") :
+            if not re.fullmatch(r"\d{6}", code):
+                yield event.plain_result("用法：/fund watch add 110020 [3]（3 表示估算涨跌超过 3% 时提醒）")
+                return
+            q = await self._quote_one(code)
+            if not q:
+                yield event.plain_result(f"没查到基金 {code}。")
+                return
+            a = to_money(alert.rstrip("%")) if alert else None
+            self.storage.watch_add(base, code, q.name or code, abs(a) if a else None)
+            tip = f"，盘中估算涨跌超过 {abs(a):g}% 时提醒（需开启每日推送）" if a else ""
+            yield event.plain_result(f"已加入自选：{q.name}（{code}）{tip}。看板底部会显示自选的涨跌。")
+            return
+        if act in ("del", "删除"):
+            ok = self.storage.watch_del(base, code)
+            yield event.plain_result("已移出自选。" if ok else f"自选里没有 {code}。")
+            return
+        if act in ("check", "重叠", "对比"):
+            if not re.fullmatch(r"\d{6}", code):
+                yield event.plain_result("用法：/fund watch check 110020")
+                return
+            try:
+                target = await self.ds.get_holdings(code)
+            except DataSourceError:
+                yield event.plain_result("没取到这只基金的重仓股。")
+                return
+            holdings = self._merged_holdings(base)
+            lines = [f"🔍 如果买入 {code}，和现有持仓的重仓股重叠情况"]
+            if not target.stocks:
+                lines.append("这只基金没有披露股票持仓（可能是债券或货币基金）。")
+            res = []
+            if any(h.code == code for h in holdings):
+                lines.append("（你已经持有这只基金）")
+            for h in holdings:
+                if h.code == code:
+                    continue
+                try:
+                    hh = await self.ds.get_holdings(h.code)
+                except DataSourceError:
+                    continue
+                ov, common = pair_overlap(target, hh)
+                if common:
+                    res.append((ov, h.name, common))
+            for ov, name, common in sorted(res, reverse=True):
+                lines.append(f"· 与 {name}：{ov:.1f}%（共同：{'、'.join(common[:4])}{'等' if len(common) > 4 else ''}）")
+            if target.stocks and not res:
+                lines.append("和现有持仓的前十大重仓股没有重合。")
+            lines.append("重叠度 = 共同重仓股在两只基金中占净值比例的较小值之和，基于季报前十大重仓股。")
+            yield event.plain_result("\n".join(lines))
+            return
+        watch = self.storage.watchlist(base)
+        if not watch:
+            yield event.plain_result("自选为空。添加：/fund watch add 代码 [提醒%]")
+            return
+        try:
+            quotes = await self.ds.get_quotes([c for c, _, _ in watch])
+        except DataSourceError:
+            quotes = {}
+        lines = ["👀 自选"] + [watch_line(c, n, quotes.get(c), a) for c, n, a in watch]
+        lines.append("管理：/fund watch add|del 代码 ｜ 看重叠：/fund watch check 代码")
+        yield event.plain_result("\n".join(lines))
+
+    # ------------------------------------------------------------ 备份（v0.8）
+    @fund.command("export", alias={"导出", "备份"})
+    async def export(self, event: AstrMessageEvent):
+        """导出全部数据为 zip（CSV）"""
+        if not event.is_private_chat():
+            yield event.plain_result("备份里有完整的持仓和交易金额，请私聊机器人导出。")
+            return
+        base = self._base(event)
+        data = self.storage.export_user(base, self.storage.accounts(base))
+        now = datetime.now(CN_TZ)
+        blob = pack_zip(data, {"plugin": PLUGIN_NAME, "version": "0.8.0", "exported_at": now.strftime("%Y-%m-%d %H:%M")})
+        path = self.data_dir / f"fund_backup_{now:%Y%m%d_%H%M%S}.zip"
+        path.write_bytes(blob)
+        counts = "、".join(f"{k} {len(v)} 条" for k, v in data.items() if v)
+        yield event.plain_result(f"已导出：{counts or '没有数据'}。每张表一个 CSV，可以用 Excel 打开。")
+        yield event.chain_result([Comp.File(name=path.name, file=str(path))])
+
+    @fund.command("restore", alias={"恢复"})
+    async def restore(self, event: AstrMessageEvent):
+        """从备份 zip 恢复"""
+        if not event.is_private_chat():
+            yield event.plain_result("请私聊机器人恢复备份。")
+            return
+        base = self._base(event)
+        state = {"data": None}
+        yield event.plain_result(
+            "请发送用 /fund export 导出的 zip 文件。恢复会覆盖你当前全部的持仓、交易、定投、笔记、标签、目标、自选和账户。回复「取消」退出。"
+        )
+
+        @session_waiter(timeout=300, record_history_chains=False)
+        async def waiter(controller: SessionController, ev: AstrMessageEvent):
+            text = (ev.message_str or "").strip()
+            if text in CANCEL_WORDS:
+                await ev.send(ev.plain_result("已取消恢复。"))
+                controller.stop()
+                return
+            if state["data"] is None:
+                files = [c for c in ev.get_messages() if isinstance(c, Comp.File)]
+                if not files:
+                    await ev.send(ev.plain_result("请发送 zip 备份文件，或回复「取消」。"))
+                    return
+                try:
+                    path = await files[0].get_file()
+                    data, meta = unpack_zip(path)
+                except Exception as e:  # noqa: BLE001
+                    await ev.send(ev.plain_result(f"读取备份失败：{e}"))
+                    return
+                state["data"] = data
+                counts = "、".join(f"{k} {len(v)} 条" for k, v in data.items() if v)
+                await ev.send(ev.plain_result(
+                    f"备份导出于 {meta.get('exported_at', '?')[:16]}，包含：{counts}。\n回复「确认恢复」覆盖当前数据，或「取消」。"
+                ))
+                controller.keep(timeout=300, reset_timeout=True)
+                return
+            if text == "确认恢复":
+                counts = self.storage.restore_user(base, state["data"])
+                self.storage.set_meta(f"account:{base}", "")
+                await ev.send(ev.plain_result(
+                    f"✅ 已恢复：持仓 {counts['holdings']} 条、交易 {counts['trades']} 条、定投 {counts['sip_plans']} 个、笔记 {counts['notes']} 条。当前账户已切回「默认」。"
+                ))
+                controller.stop()
+                return
+            await ev.send(ev.plain_result("回复「确认恢复」或「取消」。"))
+
+        try:
+            await waiter(event)
+        except TimeoutError:
+            yield event.plain_result("恢复已超时结束。")
+        finally:
+            event.stop_event()
 
     # ------------------------------------------------------------ 周报
     async def _commentary(self, prompt: str, umo: str | None) -> str:
@@ -1277,6 +1558,9 @@ class FundBoard(Star):
                 self.storage, uid, summary, day_th, dd_th, portfolio, fund_dds, dry=(mode == "manual")
             )
             extra.extend(alert_lines)
+            if mode == "nav" and self.config.get("fund_change_alert", True):
+                names = {r.code: r.name for r in summary.rows}
+                extra.extend(await self._state_changes(uid, codes, names))
             if mode == "nav":
                 today_s = now.strftime("%Y-%m-%d")
                 extra.extend(t for d, t in self._sip_done.get(uid, []) if d == today_s)

@@ -29,6 +29,11 @@ FUND_LIST_URL = "https://fund.eastmoney.com/js/fundcode_search.js"
 PINGZHONG_URL = "https://fund.eastmoney.com/pingzhongdata/{code}.js"
 # 天天基金移动端：最新一期季报前十大重仓股（含所属行业）
 HOLDINGS_URL = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNInverstPosition"
+# 天天基金移动端：基金基本信息（申购/赎回状态、申购限额、申购费率）
+BASIC_URL = "https://fundmobapi.eastmoney.com/FundMNewApi/FundMNNBasicInformation"
+# 天天基金 F10：费率页面（管理费、托管费、销售服务费、赎回费）
+FEE_URL = "https://fundf10.eastmoney.com/jjfl_{code}.html"
+MOBILE_PARAMS = {"deviceid": "Wap", "plat": "WAP", "product": "EFund", "version": "2.0.0"}
 
 
 def _num(v) -> float | None:
@@ -89,6 +94,27 @@ def extract_js_var(text: str, name: str):
     return value
 
 
+@dataclass
+class FundBasic:
+    buy_status: str  # 申购状态，如 开放申购 / 暂停申购 / 限大额
+    sell_status: str  # 赎回状态
+    max_buy: str  # 申购上限（原样）
+    buy_rate: float | None  # 当前申购费率 %（平台折扣后）
+    source_rate: float | None  # 原申购费率 %
+
+
+@dataclass
+class FundFees:
+    manage: float | None  # 管理费率 %/年
+    custody: float | None  # 托管费率 %/年
+    service: float | None  # 销售服务费率 %/年（C 类才有）
+    redeem: list[tuple[str, float]]  # [(持有期限, 赎回费率%)]
+
+    @property
+    def yearly(self) -> float:
+        return sum(x or 0.0 for x in (self.manage, self.custody, self.service))
+
+
 def parse_work_days(s: str) -> int:
     """'9年又50天' / '1年' / '200天' -> 天数。"""
     years = re.search(r"(\d+)\s*年", s or "")
@@ -121,6 +147,8 @@ class FundDataSource:
         self._pz_cache: dict[str, tuple[str, str]] = {}  # code -> (日期, 脚本内容)
         self._holdings_cache: dict[str, tuple[str, "FundHoldings"]] = {}
         self._pz_locks: dict[str, asyncio.Lock] = {}
+        self._basic_cache: dict[str, tuple[str, FundBasic]] = {}
+        self._fee_cache: dict[str, tuple[str, FundFees]] = {}
 
     # ------------------------------------------------------------------ HTTP
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -340,16 +368,80 @@ class FundDataSource:
         rd = payload.get("Expansion")
         return FundHoldings(str(rd)[:10] if rd else None, stocks[:10])
 
+    # ------------------------------------------------------------ 基本信息与费率
+    @staticmethod
+    def parse_basic(payload: dict) -> FundBasic:
+        if not payload or not payload.get("Success") or not payload.get("Datas"):
+            raise DataSourceError("基本信息接口返回失败")
+        d = payload["Datas"]
+        return FundBasic(
+            buy_status=str(d.get("SGZT") or ""),
+            sell_status=str(d.get("SHZT") or ""),
+            max_buy=str(d.get("MAXSG") or ""),
+            buy_rate=_num(d.get("RATE")),
+            source_rate=_num(d.get("SOURCERATE")),
+        )
+
+    async def get_basic(self, code: str) -> FundBasic:
+        day = time.strftime("%Y%m%d")
+        hit = self._basic_cache.get(code)
+        if hit and hit[0] == day:
+            return hit[1]
+        text = await self._fetch_text(BASIC_URL, params={"FCODE": code, **MOBILE_PARAMS})
+        try:
+            b = self.parse_basic(json.loads(text))
+        except json.JSONDecodeError as e:
+            raise DataSourceError("基本信息接口返回的不是 JSON") from e
+        self._basic_cache[code] = (day, b)
+        return b
+
+    @staticmethod
+    def parse_fees(html: str) -> FundFees:
+        """从费率页面里取运作费用和赎回费率；兼容 HTML 表格和纯文本两种形式。"""
+        text = re.sub(r"<[^>]+>", "|", html)
+        text = re.sub(r"[|\s]+", "|", text)
+
+        def rate(label: str) -> float | None:
+            m = re.search(rf"{label}\|([0-9.]+)%", text)
+            return float(m.group(1)) if m else None
+
+        redeem = []
+        for m in re.finditer(r"\|((?:小于|大于等于|大于|等于)[^|%]{0,24}?(?:天|日|月|年)[^|%]{0,12})\|([0-9.]+)%", text):
+            item = (m.group(1), float(m.group(2)))
+            if item not in redeem:
+                redeem.append(item)
+        fees = FundFees(rate("管理费率"), rate("托管费率"), rate("销售服务费率"), redeem)
+        if fees.manage is None and fees.custody is None:
+            raise DataSourceError("费率页面格式无法识别")
+        return fees
+
+    async def get_fees(self, code: str) -> FundFees:
+        """费率很少变化，按天缓存。"""
+        day = time.strftime("%Y%m%d")
+        hit = self._fee_cache.get(code)
+        if hit and hit[0] == day:
+            return hit[1]
+        f = self.parse_fees(await self._fetch_text(FEE_URL.format(code=code)))
+        self._fee_cache[code] = (day, f)
+        return f
+
+    @staticmethod
+    def parse_dividends(text: str) -> list[tuple[int, str]]:
+        """单位净值走势里 unitMoney 非空的日子就是分红或拆分日：[(时间戳毫秒, 说明)]。"""
+        rows = extract_js_var(text, "Data_netWorthTrend") or []
+        return [(int(r["x"]), str(r["unitMoney"]).strip()) for r in rows
+                if isinstance(r, dict) and r.get("x") is not None and str(r.get("unitMoney") or "").strip()]
+
+    async def get_dividends(self, code: str) -> list[tuple[int, str]]:
+        return self.parse_dividends(await self._get_pingzhong(code))
+
     async def get_holdings(self, code: str) -> FundHoldings:
         """最新一期季报前十大重仓股，按天缓存。"""
         day = time.strftime("%Y%m%d")
         hit = self._holdings_cache.get(code)
         if hit and hit[0] == day:
             return hit[1]
-        text = await self._fetch_text(
-            HOLDINGS_URL,
-            params={"FCODE": code, "deviceid": "Wap", "plat": "WAP", "product": "EFund", "version": "2.0.0"},
-        )
+        text = await self._fetch_text(HOLDINGS_URL, params={"FCODE": code, **MOBILE_PARAMS})
         try:
             payload = json.loads(text)
         except json.JSONDecodeError as e:
