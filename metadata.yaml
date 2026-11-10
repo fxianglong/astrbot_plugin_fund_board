@@ -1,7 +1,26 @@
 name: astrbot_plugin_fund_board
 display_name: 基金持仓看板
-desc: 记录基金持仓，查看估值与盈亏；截图导入、交易与定投记录、每日推送与回撤提醒、收益与基准对比、重仓股穿透与组合体检、目标配置与压力测试、决策复盘、AI 周报和自然语言查询。
-short_desc: 基金持仓看板，截图一键导入
-version: v0.8.0
+short_desc: 基金持仓看板：截图一键导入，盘中估值、盈亏、日报与回撤提醒
+desc: |
+  在聊天里记录基金持仓，查看盘中估值和盈亏。
+
+  - 发送 App 持仓页截图，一键识别导入持仓
+  - 图片看板：每只基金当日涨跌、市值、今日与累计盈亏
+  - 交易日定时推送日报，回撤、盘中涨跌提醒；QDII 净值次日补推
+  - 加仓、赎回、定投记录；收益与基准对比（XIRR、时间加权）
+  - 重仓股穿透、持仓重叠与集中度体检；目标配置与压力测试
+  - 决策日志与复盘、AI 周报，也能直接用自然语言问自己的持仓
+  数据来自公开行情接口，仅供记录参考，不构成投资建议。
+version: 0.8.0
 author: fxianglong
 repo: https://github.com/fxianglong/astrbot_plugin_fund_board
+social_link: https://github.com/fxianglong
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+tags:
+  - 工具
+  - 基金
+  - 理财
+  - 投资

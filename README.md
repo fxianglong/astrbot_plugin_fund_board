@@ -4,9 +4,12 @@
 
 v0.5 起又加入了收益与基准对比（XIRR、时间加权）、盘中估值提醒、目标配置与偏离提醒、情景压力测试、决策日志与到期复盘、定投计划、费用透视、基金异动提醒、自选关注、备份恢复和多账户。
 
+<p align="center"><img src="docs/board.png" width="60%" alt="持仓看板"></p>
+<p align="center"><sub>图片看板（示例数据）</sub></p>
+
 ## 安装
 
-1. 把整个 `astrbot_plugin_fund_board` 文件夹放到 AstrBot 的 `data/plugins/` 目录下。
+1. 在 AstrBot WebUI 的插件市场搜索「基金持仓看板」安装，或在插件管理里通过仓库地址 `https://github.com/fxianglong/astrbot_plugin_fund_board` 安装；也可以把整个 `astrbot_plugin_fund_board` 文件夹放到 AstrBot 的 `data/plugins/` 目录下。
 2. 重启 AstrBot，或者在 WebUI 的插件管理里重载插件。AstrBot 会自动安装 `requirements.txt` 中的依赖（rapidfuzz）。
 3. 截图导入需要支持图片输入的大模型，例如 GPT-4o、Qwen-VL、GLM-4V。可以在插件配置的「截图识别使用的模型」里指定；不指定时使用当前会话的对话模型。
 
